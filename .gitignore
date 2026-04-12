@@ -10,8 +10,6 @@ coverage/
 .env
 .env.local
 .env.*
-!.env.example
-!.env*.example
 
 liftoff-pulumi-state/
 **/liftoff-pulumi-state/
