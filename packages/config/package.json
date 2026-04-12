@@ -1,0 +1,10 @@
+{
+  "name": "@liftoff/config",
+  "version": "0.1.0",
+  "private": true,
+  "exports": {
+    "./typescript/base": "./tsconfig.base.json",
+    "./typescript/nestjs": "./tsconfig.nestjs.json",
+    "./typescript/nextjs": "./tsconfig.nextjs.json"
+  }
+}
