@@ -1,0 +1,12 @@
+{
+  "extends": "@liftoff/config/typescript/nestjs",
+  "compilerOptions": {
+    "baseUrl": "./",
+    "paths": {
+      "@liftoff/shared": ["../../packages/shared/src"],
+      "@liftoff/shared/*": ["../../packages/shared/src/*"]
+    }
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "dist"]
+}

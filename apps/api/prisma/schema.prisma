@@ -1,0 +1,242 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  OWNER
+  ADMIN
+  DEVELOPER
+  VIEWER
+}
+
+enum ServiceType {
+  APP
+  KUBERNETES
+}
+
+enum DeploymentStatus {
+  PENDING
+  QUEUED
+  BUILDING
+  PUSHING
+  PROVISIONING
+  DEPLOYING
+  SUCCESS
+  FAILED
+  ROLLING_BACK
+  ROLLED_BACK
+  CANCELLED
+}
+
+enum LogLevel {
+  DEBUG
+  INFO
+  WARN
+  ERROR
+}
+
+model User {
+  id             String         @id @default(cuid())
+  email          String         @unique
+  githubId       String         @unique @map("github_id")
+  githubUsername String         @map("github_username")
+  githubToken    String?        @map("github_token")
+  name           String?
+  avatarUrl      String?        @map("avatar_url")
+  createdAt      DateTime       @default(now()) @map("created_at")
+  updatedAt      DateTime       @updatedAt @map("updated_at")
+  deletedAt      DateTime?      @map("deleted_at")
+  doAccounts     DOAccount[]
+  projects       Project[]
+  teamMembers    TeamMember[]
+  refreshTokens  RefreshToken[]
+
+  @@map("users")
+}
+
+model RefreshToken {
+  id        String    @id @default(cuid())
+  userId    String    @map("user_id")
+  token     String    @unique
+  expiresAt DateTime  @map("expires_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+  revokedAt DateTime? @map("revoked_at")
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+model DOAccount {
+  id           String        @id @default(cuid())
+  userId       String        @map("user_id")
+  doToken      String        @map("do_token")
+  region       String        @default("nyc3")
+  validatedAt  DateTime?     @map("validated_at")
+  createdAt    DateTime      @default(now()) @map("created_at")
+  updatedAt    DateTime      @updatedAt @map("updated_at")
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  environments Environment[]
+
+  @@index([userId])
+  @@map("do_accounts")
+}
+
+model Project {
+  id           String        @id @default(cuid())
+  userId       String        @map("user_id")
+  name         String
+  description  String?
+  createdAt    DateTime      @default(now()) @map("created_at")
+  updatedAt    DateTime      @updatedAt @map("updated_at")
+  deletedAt    DateTime?     @map("deleted_at")
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  environments Environment[]
+  teamMembers  TeamMember[]
+  repository   Repository?
+
+  @@unique([userId, name])
+  @@index([userId])
+  @@map("projects")
+}
+
+model TeamMember {
+  id        String   @id @default(cuid())
+  projectId String   @map("project_id")
+  userId    String   @map("user_id")
+  role      Role     @default(DEVELOPER)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, userId])
+  @@map("team_members")
+}
+
+model Repository {
+  id            String   @id @default(cuid())
+  projectId     String   @unique @map("project_id")
+  githubId      Int      @map("github_id")
+  fullName      String   @map("full_name")
+  cloneUrl      String   @map("clone_url")
+  branch        String   @default("main")
+  webhookId     Int?     @map("webhook_id")
+  webhookSecret String?  @map("webhook_secret")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+  project       Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@map("repositories")
+}
+
+model Environment {
+  id           String                     @id @default(cuid())
+  projectId    String                     @map("project_id")
+  doAccountId  String                     @map("do_account_id")
+  name         String
+  gitBranch    String                     @map("git_branch")
+  liftoffDeploySecret String?             @map("liftoff_deploy_secret")
+  serviceType  ServiceType                @default(APP) @map("service_type")
+  configYaml   String?                    @map("config_yaml")
+  configParsed Json?                      @map("config_parsed")
+  createdAt    DateTime                   @default(now()) @map("created_at")
+  updatedAt    DateTime                   @updatedAt @map("updated_at")
+  deletedAt    DateTime?                  @map("deleted_at")
+  project      Project                    @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  doAccount    DOAccount                  @relation(fields: [doAccountId], references: [id])
+  deployments  Deployment[]
+  pulumiStack  PulumiStack?
+  resources    InfrastructureResource[]
+  alerts       Alert[]
+
+  @@unique([projectId, name])
+  @@index([projectId])
+  @@map("environments")
+}
+
+model Deployment {
+  id            String           @id @default(cuid())
+  environmentId String           @map("environment_id")
+  status        DeploymentStatus @default(PENDING)
+  commitSha     String?          @map("commit_sha")
+  commitMessage String?          @map("commit_message")
+  branch        String?
+  imageUri      String?          @map("image_uri")
+  triggeredBy   String?          @map("triggered_by")
+  endpoint      String?
+  errorMessage  String?          @map("error_message")
+  startedAt     DateTime?        @map("started_at")
+  completedAt   DateTime?        @map("completed_at")
+  createdAt     DateTime         @default(now()) @map("created_at")
+  updatedAt     DateTime         @updatedAt @map("updated_at")
+  environment   Environment      @relation(fields: [environmentId], references: [id], onDelete: Cascade)
+  logs          DeploymentLog[]
+
+  @@index([environmentId])
+  @@index([environmentId, createdAt(sort: Desc)])
+  @@map("deployments")
+}
+
+model DeploymentLog {
+  id           String     @id @default(cuid())
+  deploymentId String     @map("deployment_id")
+  level        LogLevel   @default(INFO)
+  message      String
+  source       String     @default("system")
+  timestamp    DateTime   @default(now())
+  deployment   Deployment @relation(fields: [deploymentId], references: [id], onDelete: Cascade)
+
+  @@index([deploymentId, timestamp])
+  @@map("deployment_logs")
+}
+
+model PulumiStack {
+  id             String      @id @default(cuid())
+  environmentId  String      @unique @map("environment_id")
+  stackName      String      @map("stack_name")
+  stateSpacesKey String      @map("state_spaces_key")
+  outputs        Json?
+  lastUpdated    DateTime?   @map("last_updated")
+  createdAt      DateTime    @default(now()) @map("created_at")
+  updatedAt      DateTime    @updatedAt @map("updated_at")
+  environment    Environment @relation(fields: [environmentId], references: [id], onDelete: Cascade)
+
+  @@map("pulumi_stacks")
+}
+
+model InfrastructureResource {
+  id            String      @id @default(cuid())
+  environmentId String      @map("environment_id")
+  resourceType  String      @map("resource_type")
+  resourceName  String      @map("resource_name")
+  doResourceId  String?     @map("do_resource_id")
+  doRegion      String      @map("do_region")
+  tags          Json?
+  createdAt     DateTime    @default(now()) @map("created_at")
+  updatedAt     DateTime    @updatedAt @map("updated_at")
+  environment   Environment @relation(fields: [environmentId], references: [id], onDelete: Cascade)
+
+  @@index([environmentId])
+  @@map("infrastructure_resources")
+}
+
+model Alert {
+  id                String      @id @default(cuid())
+  environmentId     String      @map("environment_id")
+  name              String
+  type              String
+  threshold         Float
+  notificationEmail String?     @map("notification_email")
+  doAlertId         String?     @map("do_alert_id")
+  createdAt         DateTime    @default(now()) @map("created_at")
+  updatedAt         DateTime    @updatedAt @map("updated_at")
+  environment       Environment @relation(fields: [environmentId], references: [id], onDelete: Cascade)
+
+  @@map("alerts")
+}
