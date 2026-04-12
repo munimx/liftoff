@@ -1,0 +1,21 @@
+{
+  "name": "@liftoff/pulumi-components",
+  "version": "0.1.0",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsc -p tsconfig.json --watch",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@liftoff/shared": "workspace:*",
+    "@pulumi/digitalocean": "^4.63.0",
+    "@pulumi/pulumi": "^3.229.0"
+  },
+  "devDependencies": {
+    "@liftoff/config": "workspace:*",
+    "typescript": "^5.6.3"
+  }
+}

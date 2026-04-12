@@ -1,0 +1,238 @@
+import { InjectQueue } from '@nestjs/bullmq';
+import {
+  InfrastructureResource,
+  Prisma,
+  Role,
+} from '@prisma/client';
+import {
+  ErrorCodes,
+  safeParseLiftoffConfig,
+} from '@liftoff/shared';
+import { Queue } from 'bullmq';
+import * as yaml from 'js-yaml';
+import { Injectable } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { Exceptions } from '../common/exceptions/app.exception';
+import { EncryptionService } from '../common/services/encryption.service';
+import { PrismaService } from '../prisma/prisma.service';
+import {
+  InfraDestroyJobPayload,
+  JOB_NAMES,
+  QUEUE_NAMES,
+} from '../queues/queue.constants';
+import { ProjectsService } from '../projects/projects.service';
+import { PulumiRunnerService } from './pulumi-runner.service';
+import {
+  AppPlatformStackArgs,
+  PulumiPreviewResult,
+} from './types/pulumi.types';
+
+type EnvironmentPreviewContext = Prisma.EnvironmentGetPayload<{
+  include: {
+    project: {
+      select: {
+        id: true;
+        name: true;
+      };
+    };
+    doAccount: {
+      select: {
+        doToken: true;
+        region: true;
+      };
+    };
+    deployments: {
+      where: {
+        imageUri: {
+          not: null;
+        };
+      };
+      orderBy: {
+        createdAt: 'desc';
+      };
+      take: 1;
+      select: {
+        imageUri: true;
+      };
+    };
+  };
+}>;
+
+/**
+ * Handles infrastructure preview, destroy queueing, and resource listing endpoints.
+ */
+@Injectable()
+export class InfrastructureService {
+  public constructor(
+    private readonly prismaService: PrismaService,
+    private readonly projectsService: ProjectsService,
+    private readonly configService: ConfigService,
+    private readonly encryptionService: EncryptionService,
+    private readonly pulumiRunnerService: PulumiRunnerService,
+    @InjectQueue(QUEUE_NAMES.INFRASTRUCTURE)
+    private readonly infrastructureQueue: Queue<InfraDestroyJobPayload>,
+  ) {}
+
+  /**
+   * Runs a Pulumi preview for an environment.
+   */
+  public async previewInfra(environmentId: string, userId: string): Promise<PulumiPreviewResult> {
+    const environment = await this.getEnvironmentContext(environmentId);
+    await this.projectsService.assertProjectRole(environment.project.id, userId, [
+      Role.OWNER,
+      Role.ADMIN,
+    ]);
+
+    const config = this.resolveEnvironmentConfig(environment);
+    const doToken = this.decryptDoToken(environment.doAccount.doToken);
+    const docrName = this.configService.getOrThrow<string>('DOCR_NAME');
+    const stackName = this.buildStackName(environment.project.id, environment.name);
+
+    const stackArgs: AppPlatformStackArgs = {
+      projectName: environment.project.name,
+      projectId: environment.project.id,
+      environmentName: environment.name,
+      environmentId: environment.id,
+      doRegion: environment.doAccount.region,
+      doToken,
+      docrName,
+      imageUri: this.resolveImageUri(environment, docrName),
+      config,
+    };
+
+    return this.pulumiRunnerService.preview({
+      stackName,
+      doToken,
+      args: stackArgs,
+    });
+  }
+
+  /**
+   * Queues infrastructure destruction for an environment.
+   */
+  public async destroyInfra(environmentId: string, userId: string): Promise<void> {
+    const environment = await this.getEnvironmentContext(environmentId);
+    await this.projectsService.assertProjectRole(environment.project.id, userId, [
+      Role.OWNER,
+      Role.ADMIN,
+    ]);
+
+    await this.infrastructureQueue.add(
+      JOB_NAMES.INFRASTRUCTURE.DESTROY,
+      { environmentId },
+      {
+        attempts: 1,
+      },
+    );
+  }
+
+  /**
+   * Returns persisted infrastructure resource records for an environment.
+   */
+  public async getResources(environmentId: string, userId: string): Promise<InfrastructureResource[]> {
+    const environment = await this.getEnvironmentContext(environmentId);
+    await this.projectsService.assertProjectRole(environment.project.id, userId);
+
+    return this.prismaService.infrastructureResource.findMany({
+      where: { environmentId },
+      orderBy: { createdAt: 'asc' },
+    });
+  }
+
+  private async getEnvironmentContext(environmentId: string): Promise<EnvironmentPreviewContext> {
+    const environment = await this.prismaService.environment.findFirst({
+      where: {
+        id: environmentId,
+        deletedAt: null,
+      },
+      include: {
+        project: {
+          select: {
+            id: true,
+            name: true,
+          },
+        },
+        doAccount: {
+          select: {
+            doToken: true,
+            region: true,
+          },
+        },
+        deployments: {
+          where: {
+            imageUri: {
+              not: null,
+            },
+          },
+          orderBy: {
+            createdAt: 'desc',
+          },
+          take: 1,
+          select: {
+            imageUri: true,
+          },
+        },
+      },
+    });
+
+    if (!environment) {
+      throw Exceptions.notFound('Environment not found', ErrorCodes.ENVIRONMENT_NOT_FOUND);
+    }
+
+    return environment;
+  }
+
+  private resolveEnvironmentConfig(environment: EnvironmentPreviewContext): AppPlatformStackArgs['config'] {
+    if (environment.configParsed !== null) {
+      const parsedResult = safeParseLiftoffConfig(environment.configParsed);
+      if (parsedResult.success) {
+        return parsedResult.data;
+      }
+    }
+
+    if (!environment.configYaml) {
+      throw Exceptions.badRequest(
+        'Environment configuration is missing',
+        ErrorCodes.CONFIG_MISSING_REQUIRED_FIELDS,
+      );
+    }
+
+    let yamlPayload: unknown;
+    try {
+      yamlPayload = yaml.load(environment.configYaml);
+    } catch {
+      throw Exceptions.badRequest('Invalid liftoff.yml YAML syntax', ErrorCodes.CONFIG_INVALID_YAML);
+    }
+
+    const parsedConfig = safeParseLiftoffConfig(yamlPayload);
+    if (!parsedConfig.success) {
+      throw Exceptions.badRequest('liftoff.yml validation failed', ErrorCodes.CONFIG_VALIDATION_FAILED);
+    }
+
+    return parsedConfig.data;
+  }
+
+  private resolveImageUri(environment: EnvironmentPreviewContext, docrName: string): string {
+    const latestImageUri = environment.deployments[0]?.imageUri;
+    if (latestImageUri) {
+      return latestImageUri;
+    }
+
+    return `registry.digitalocean.com/${docrName}/${environment.project.name}/${environment.name}:preview`;
+  }
+
+  private decryptDoToken(encryptedToken: string): string {
+    try {
+      return this.encryptionService.decrypt(encryptedToken);
+    } catch {
+      throw Exceptions.internalError(
+        'Stored DigitalOcean token cannot be decrypted',
+        ErrorCodes.DO_ACCOUNT_VALIDATION_FAILED,
+      );
+    }
+  }
+
+  private buildStackName(projectId: string, environmentName: string): string {
+    return `organization/${projectId}/${environmentName}`;
+  }
+}

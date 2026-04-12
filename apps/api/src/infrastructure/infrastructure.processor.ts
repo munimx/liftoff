@@ -1,0 +1,727 @@
+import { Processor, WorkerHost } from '@nestjs/bullmq';
+import {
+  DeploymentStatus,
+  LogLevel,
+  Prisma,
+  type Deployment,
+} from '@prisma/client';
+import {
+  DeploymentStatusType,
+  ErrorCodes,
+  safeParseLiftoffConfig,
+} from '@liftoff/shared';
+import { ConfigService } from '@nestjs/config';
+import { Injectable, Logger } from '@nestjs/common';
+import type { Job } from 'bullmq';
+import * as yaml from 'js-yaml';
+import { Exceptions } from '../common/exceptions/app.exception';
+import { EncryptionService } from '../common/services/encryption.service';
+import { EventsGateway } from '../events/events.gateway';
+import { PrismaService } from '../prisma/prisma.service';
+import {
+  InfraDestroyJobPayload,
+  InfraProvisionJobPayload,
+  JOB_NAMES,
+  QUEUE_TIMEOUTS,
+  QUEUE_NAMES,
+} from '../queues/queue.constants';
+import { PulumiRunnerService } from './pulumi-runner.service';
+import {
+  AppPlatformStackArgs,
+  PulumiLogLevel,
+  PulumiResourceProgress,
+  PulumiStackOutputs,
+} from './types/pulumi.types';
+
+type DeploymentWithEnvironment = Deployment & {
+  environment: {
+    id: string;
+    name: string;
+    doAccount: {
+      doToken: string;
+      region: string;
+    };
+    project: {
+      id: string;
+      name: string;
+    };
+  };
+};
+
+type EnvironmentWithProvisioningData = {
+  id: string;
+  name: string;
+  configYaml: string | null;
+  configParsed: Prisma.JsonValue | null;
+  doAccount: {
+    doToken: string;
+    region: string;
+  };
+  project: {
+    id: string;
+    name: string;
+  };
+  pulumiStack: {
+    stackName: string;
+  } | null;
+  deployments: Array<{
+    imageUri: string | null;
+  }>;
+};
+
+const SUPPORTED_DO_REGIONS = [
+  'nyc1',
+  'nyc3',
+  'sfo2',
+  'sfo3',
+  'ams3',
+  'sgp1',
+  'lon1',
+  'fra1',
+  'tor1',
+  'blr1',
+  'syd1',
+] as const;
+
+/**
+ * Processes infrastructure provisioning and destruction queue jobs.
+ */
+@Injectable()
+@Processor(QUEUE_NAMES.INFRASTRUCTURE)
+export class InfrastructureProcessor extends WorkerHost {
+  private readonly logger = new Logger(InfrastructureProcessor.name);
+
+  public constructor(
+    private readonly prismaService: PrismaService,
+    private readonly configService: ConfigService,
+    private readonly encryptionService: EncryptionService,
+    private readonly pulumiRunnerService: PulumiRunnerService,
+    private readonly eventsGateway: EventsGateway,
+  ) {
+    super();
+  }
+
+  /**
+   * Routes queue jobs to the corresponding infrastructure handler.
+   */
+  public async process(job: Job, _token?: string): Promise<void> {
+    if (job.name === JOB_NAMES.INFRASTRUCTURE.PROVISION) {
+      await this.handleProvision(job as Job<InfraProvisionJobPayload>);
+      return;
+    }
+
+    if (job.name === JOB_NAMES.INFRASTRUCTURE.DESTROY) {
+      await this.handleDestroy(job as Job<InfraDestroyJobPayload>);
+      return;
+    }
+
+    this.logger.warn(`Ignoring unsupported infrastructure job: ${job.name}`);
+  }
+
+  /**
+   * Provisions infrastructure for a deployment after image build/push succeeds.
+   */
+  private async handleProvision(job: Job<InfraProvisionJobPayload>): Promise<void> {
+    const deployment = await this.getDeploymentForProvision(job.data);
+    const stackName = this.buildStackName(deployment.environment.project.id, deployment.environment.name);
+    const stateSpacesKey = this.buildStateSpacesKey(stackName);
+    const doToken = this.decryptDoToken(deployment.environment.doAccount.doToken);
+    const config = this.parseLiftoffConfig(job.data.configYaml);
+    const docrName = this.configService.getOrThrow<string>('DOCR_NAME');
+
+    await this.prismaService.deployment.update({
+      where: { id: deployment.id },
+      data: {
+        status: DeploymentStatus.PROVISIONING,
+        errorMessage: null,
+        startedAt: deployment.startedAt ?? new Date(),
+      },
+    });
+    this.broadcastDeploymentStatus(deployment.id, DeploymentStatus.PROVISIONING);
+
+    const stackArgs: AppPlatformStackArgs = {
+      projectName: deployment.environment.project.name,
+      projectId: deployment.environment.project.id,
+      environmentName: deployment.environment.name,
+      environmentId: deployment.environment.id,
+      doRegion: deployment.environment.doAccount.region,
+      doToken,
+      docrName,
+      imageUri: job.data.imageUri,
+      config,
+    };
+
+    const runResult = await this.runProvisionWithTimeout(deployment.id, {
+      stackName,
+      doToken,
+      args: stackArgs,
+      onLog: (line, level) => {
+        void this.persistDeploymentLog(deployment.id, line, level).catch((error) => {
+          this.logger.error(this.resolveErrorMessage(error));
+        });
+      },
+      onResourceProgress: (progress) => {
+        this.broadcastInfraProgress(deployment.id, progress);
+      },
+    });
+
+    if (!runResult.success) {
+      const errorMessage = this.sanitizeErrorMessage(
+        runResult.error ?? 'Pulumi provisioning failed',
+      );
+
+      await this.prismaService.deployment.update({
+        where: { id: deployment.id },
+        data: {
+          status: DeploymentStatus.FAILED,
+          errorMessage,
+          completedAt: new Date(),
+        },
+      });
+      this.broadcastDeploymentStatus(deployment.id, DeploymentStatus.FAILED);
+      this.eventsGateway.broadcastDeploymentComplete({
+        deploymentId: deployment.id,
+        status: DeploymentStatus.FAILED as DeploymentStatusType,
+      });
+
+      throw Exceptions.internalError(errorMessage, ErrorCodes.PULUMI_EXECUTION_FAILED);
+    }
+
+    const outputs = this.assertRequiredOutputs(runResult.outputs);
+    const resourceTags = this.createResourceTags(
+      deployment.environment.project.name,
+      deployment.environment.name,
+    );
+
+    await this.prismaService.$transaction(async (transaction) => {
+      await transaction.pulumiStack.upsert({
+        where: { environmentId: deployment.environment.id },
+        create: {
+          environmentId: deployment.environment.id,
+          stackName,
+          stateSpacesKey,
+          outputs: this.toJsonObject(outputs),
+          lastUpdated: new Date(),
+        },
+        update: {
+          stackName,
+          stateSpacesKey,
+          outputs: this.toJsonObject(outputs),
+          lastUpdated: new Date(),
+        },
+      });
+
+      await transaction.infrastructureResource.deleteMany({
+        where: { environmentId: deployment.environment.id },
+      });
+
+      const resources = this.buildInfrastructureResources(
+        deployment.environment.id,
+        deployment.environment.doAccount.region,
+        outputs,
+        resourceTags,
+      );
+      if (resources.length > 0) {
+        await transaction.infrastructureResource.createMany({
+          data: resources,
+        });
+      }
+
+      await transaction.deployment.update({
+        where: { id: deployment.id },
+        data: {
+          status: DeploymentStatus.DEPLOYING,
+          endpoint: outputs.appUrl,
+          errorMessage: null,
+        },
+      });
+    });
+
+    this.broadcastDeploymentStatus(deployment.id, DeploymentStatus.DEPLOYING);
+
+    await this.prismaService.deployment.update({
+      where: {
+        id: deployment.id,
+      },
+      data: {
+        status: DeploymentStatus.SUCCESS,
+        endpoint: outputs.appUrl,
+        errorMessage: null,
+        completedAt: new Date(),
+      },
+    });
+
+    this.broadcastDeploymentStatus(deployment.id, DeploymentStatus.SUCCESS);
+    this.eventsGateway.broadcastDeploymentComplete({
+      deploymentId: deployment.id,
+      status: DeploymentStatus.SUCCESS as DeploymentStatusType,
+      endpoint: outputs.appUrl,
+    });
+  }
+
+  /**
+   * Destroys an environment stack and clears tracked infrastructure records.
+   */
+  private async handleDestroy(job: Job<InfraDestroyJobPayload>): Promise<void> {
+    const environment = await this.getEnvironmentForDestroy(job.data.environmentId);
+    const doToken = this.decryptDoToken(environment.doAccount.doToken);
+    const docrName = this.configService.getOrThrow<string>('DOCR_NAME');
+    const stackName =
+      environment.pulumiStack?.stackName ??
+      this.buildStackName(environment.project.id, environment.name);
+    const config = this.resolveDestroyConfig(environment);
+    const imageUri = this.resolveImageUri(environment, docrName);
+
+    const stackArgs: AppPlatformStackArgs = {
+      projectName: environment.project.name,
+      projectId: environment.project.id,
+      environmentName: environment.name,
+      environmentId: environment.id,
+      doRegion: environment.doAccount.region,
+      doToken,
+      docrName,
+      imageUri,
+      config,
+    };
+
+    await this.pulumiRunnerService.destroy({
+      stackName,
+      doToken,
+      args: stackArgs,
+      onLog: (line, level) => {
+        this.logger.log(`[infra:destroy:${level}] ${line}`);
+      },
+    });
+
+    await this.prismaService.$transaction(async (transaction) => {
+      await transaction.infrastructureResource.deleteMany({
+        where: { environmentId: environment.id },
+      });
+
+      if (environment.pulumiStack) {
+        await transaction.pulumiStack.update({
+          where: { environmentId: environment.id },
+          data: {
+            outputs: Prisma.JsonNull,
+            lastUpdated: new Date(),
+          },
+        });
+      }
+    });
+  }
+
+  private async getDeploymentForProvision(
+    payload: InfraProvisionJobPayload,
+  ): Promise<DeploymentWithEnvironment> {
+    const deployment = await this.prismaService.deployment.findFirst({
+      where: {
+        id: payload.deploymentId,
+        environmentId: payload.environmentId,
+      },
+      include: {
+        environment: {
+          include: {
+            project: {
+              select: {
+                id: true,
+                name: true,
+              },
+            },
+            doAccount: {
+              select: {
+                doToken: true,
+                region: true,
+              },
+            },
+          },
+        },
+      },
+    });
+
+    if (!deployment) {
+      throw Exceptions.notFound('Deployment not found', ErrorCodes.DEPLOYMENT_NOT_FOUND);
+    }
+
+    return deployment;
+  }
+
+  private async getEnvironmentForDestroy(environmentId: string): Promise<EnvironmentWithProvisioningData> {
+    const environment = await this.prismaService.environment.findFirst({
+      where: {
+        id: environmentId,
+        deletedAt: null,
+      },
+      select: {
+        id: true,
+        name: true,
+        configYaml: true,
+        configParsed: true,
+        doAccount: {
+          select: {
+            doToken: true,
+            region: true,
+          },
+        },
+        project: {
+          select: {
+            id: true,
+            name: true,
+          },
+        },
+        pulumiStack: {
+          select: {
+            stackName: true,
+          },
+        },
+        deployments: {
+          where: {
+            imageUri: {
+              not: null,
+            },
+          },
+          orderBy: {
+            createdAt: 'desc',
+          },
+          take: 1,
+          select: {
+            imageUri: true,
+          },
+        },
+      },
+    });
+
+    if (!environment) {
+      throw Exceptions.notFound('Environment not found', ErrorCodes.ENVIRONMENT_NOT_FOUND);
+    }
+
+    return environment;
+  }
+
+  private resolveDestroyConfig(environment: EnvironmentWithProvisioningData): AppPlatformStackArgs['config'] {
+    if (environment.configParsed !== null) {
+      const parsedResult = safeParseLiftoffConfig(environment.configParsed);
+      if (parsedResult.success) {
+        return parsedResult.data;
+      }
+    }
+
+    if (environment.configYaml) {
+      return this.parseLiftoffConfig(environment.configYaml);
+    }
+
+    return {
+      version: '1.0',
+      service: {
+        name: environment.project.name,
+        type: 'app',
+        region: this.normalizeDoRegion(environment.doAccount.region),
+      },
+      runtime: {
+        instance_size: 'apps-s-1vcpu-0.5gb',
+        replicas: 1,
+        port: 3000,
+      },
+      env: {},
+      secrets: [],
+      build: {
+        dockerfile_path: 'Dockerfile',
+        context: '.',
+      },
+      database: {
+        enabled: false,
+        engine: 'postgres',
+        version: '15',
+        size: 'db-s-1vcpu-1gb',
+      },
+      storage: {
+        enabled: false,
+      },
+      healthcheck: {
+        path: '/health',
+        interval: 30,
+        timeout: 5,
+      },
+    };
+  }
+
+  private resolveImageUri(environment: EnvironmentWithProvisioningData, docrName: string): string {
+    const latestImageUri = environment.deployments[0]?.imageUri;
+    if (latestImageUri) {
+      return latestImageUri;
+    }
+
+    return `registry.digitalocean.com/${docrName}/${environment.project.name}/${environment.name}:latest`;
+  }
+
+  private decryptDoToken(encryptedToken: string): string {
+    try {
+      return this.encryptionService.decrypt(encryptedToken);
+    } catch {
+      throw Exceptions.internalError(
+        'Stored DigitalOcean token cannot be decrypted',
+        ErrorCodes.DO_ACCOUNT_VALIDATION_FAILED,
+      );
+    }
+  }
+
+  private parseLiftoffConfig(configYaml: string): AppPlatformStackArgs['config'] {
+    let parsedYaml: unknown;
+    try {
+      parsedYaml = yaml.load(configYaml);
+    } catch {
+      throw Exceptions.badRequest('Invalid liftoff.yml YAML syntax', ErrorCodes.CONFIG_INVALID_YAML);
+    }
+
+    const parsedConfig = safeParseLiftoffConfig(parsedYaml);
+    if (!parsedConfig.success) {
+      throw Exceptions.badRequest('liftoff.yml validation failed', ErrorCodes.CONFIG_VALIDATION_FAILED);
+    }
+
+    return parsedConfig.data;
+  }
+
+  private broadcastDeploymentStatus(deploymentId: string, status: DeploymentStatus): void {
+    this.eventsGateway.broadcastDeploymentStatus({
+      deploymentId,
+      status: status as DeploymentStatusType,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  private broadcastInfraProgress(
+    deploymentId: string,
+    progress: PulumiResourceProgress,
+  ): void {
+    this.eventsGateway.broadcastInfraProgress({
+      deploymentId,
+      resourceType: progress.resourceType,
+      resourceName: progress.resourceName,
+      action: progress.action,
+      status: progress.status,
+    });
+  }
+
+  private async persistDeploymentLog(
+    deploymentId: string,
+    line: string,
+    level: PulumiLogLevel,
+  ): Promise<void> {
+    if (!line.trim()) {
+      return;
+    }
+
+    const timestamp = new Date();
+    await this.prismaService.deploymentLog.create({
+      data: {
+        deploymentId,
+        message: line,
+        level: this.toPrismaLogLevel(level),
+        source: 'pulumi',
+        timestamp,
+      },
+    });
+
+    this.eventsGateway.broadcastDeploymentLog({
+      deploymentId,
+      line,
+      timestamp: timestamp.toISOString(),
+      level,
+      source: 'pulumi',
+    });
+  }
+
+  private toPrismaLogLevel(level: PulumiLogLevel): LogLevel {
+    if (level === 'warn') {
+      return LogLevel.WARN;
+    }
+    if (level === 'error') {
+      return LogLevel.ERROR;
+    }
+    return LogLevel.INFO;
+  }
+
+  private async runProvisionWithTimeout(
+    deploymentId: string,
+    options: Parameters<PulumiRunnerService['run']>[0],
+  ): Promise<Awaited<ReturnType<PulumiRunnerService['run']>>> {
+    let timeoutHandle: NodeJS.Timeout | undefined;
+    const timeoutMessage = `Infrastructure provisioning timed out after ${
+      QUEUE_TIMEOUTS.DEPLOYMENT_JOB_TIMEOUT_MS / 60000
+    } minutes`;
+
+    try {
+      return await Promise.race([
+        this.pulumiRunnerService.run(options),
+        new Promise<Awaited<ReturnType<PulumiRunnerService['run']>>>((resolve) => {
+          timeoutHandle = setTimeout(() => {
+            this.logger.error(`${timeoutMessage} (deploymentId=${deploymentId})`);
+            resolve({
+              success: false,
+              outputs: {},
+              error: timeoutMessage,
+            });
+          }, QUEUE_TIMEOUTS.DEPLOYMENT_JOB_TIMEOUT_MS);
+        }),
+      ]);
+    } finally {
+      if (timeoutHandle) {
+        clearTimeout(timeoutHandle);
+      }
+    }
+  }
+
+  private assertRequiredOutputs(
+    outputs: Partial<PulumiStackOutputs> | Record<string, unknown>,
+  ): PulumiStackOutputs {
+    const outputRecord = outputs as Record<string, unknown>;
+    const appId = this.resolveOutputValue(outputRecord.appId);
+    const appUrl = this.resolveOutputValue(outputRecord.appUrl);
+    const repositoryUrl = this.resolveOutputValue(outputRecord.repositoryUrl);
+
+    if (!appId || !appUrl || !repositoryUrl) {
+      throw Exceptions.internalError(
+        'Pulumi stack outputs are incomplete',
+        ErrorCodes.PULUMI_EXECUTION_FAILED,
+      );
+    }
+
+    return {
+      appId,
+      appUrl,
+      repositoryUrl,
+      dbClusterName: this.resolveOutputValue(outputRecord.dbClusterName),
+      dbUri: this.resolveOutputValue(outputRecord.dbUri),
+      bucketName: this.resolveOutputValue(outputRecord.bucketName),
+      bucketEndpoint: this.resolveOutputValue(outputRecord.bucketEndpoint),
+    };
+  }
+
+  private resolveOutputValue(value: unknown): string | undefined {
+    if (typeof value === 'string') {
+      return value;
+    }
+
+    if (typeof value === 'number' || typeof value === 'boolean') {
+      return String(value);
+    }
+
+    if (value && typeof value === 'object' && 'value' in value) {
+      const nestedValue = (value as { value?: unknown }).value;
+      if (typeof nestedValue === 'string') {
+        return nestedValue;
+      }
+      if (typeof nestedValue === 'number' || typeof nestedValue === 'boolean') {
+        return String(nestedValue);
+      }
+    }
+
+    return undefined;
+  }
+
+  private buildInfrastructureResources(
+    environmentId: string,
+    doRegion: string,
+    outputs: PulumiStackOutputs,
+    resourceTags: Prisma.JsonObject,
+  ): Prisma.InfrastructureResourceCreateManyInput[] {
+    const resources: Prisma.InfrastructureResourceCreateManyInput[] = [
+      {
+        environmentId,
+        resourceType: 'digitalocean:index/app:App',
+        resourceName: 'app-platform-app',
+        doResourceId: outputs.appId,
+        doRegion,
+        tags: resourceTags,
+      },
+      {
+        environmentId,
+        resourceType: 'digitalocean:index/containerRegistryDockerCredentials:ContainerRegistryDockerCredentials',
+        resourceName: 'registry-credentials',
+        doResourceId: outputs.repositoryUrl,
+        doRegion,
+        tags: resourceTags,
+      },
+    ];
+
+    if (outputs.dbClusterName) {
+      resources.push({
+        environmentId,
+        resourceType: 'digitalocean:index/databaseCluster:DatabaseCluster',
+        resourceName: 'managed-postgres',
+        doResourceId: outputs.dbClusterName,
+        doRegion,
+        tags: resourceTags,
+      });
+    }
+
+    if (outputs.bucketName) {
+      resources.push({
+        environmentId,
+        resourceType: 'digitalocean:index/spacesBucket:SpacesBucket',
+        resourceName: 'spaces-bucket',
+        doResourceId: outputs.bucketName,
+        doRegion,
+        tags: resourceTags,
+      });
+    }
+
+    return resources;
+  }
+
+  private createResourceTags(projectName: string, environmentName: string): Prisma.JsonObject {
+    return {
+      'liftoff-project': projectName,
+      'liftoff-environment': environmentName,
+      'liftoff-managed': 'true',
+    };
+  }
+
+  private buildStackName(projectId: string, environmentName: string): string {
+    return `organization/${projectId}/${environmentName}`;
+  }
+
+  private buildStateSpacesKey(stackName: string): string {
+    return `.pulumi/stacks/${stackName}.json`;
+  }
+
+  private normalizeDoRegion(region: string): (typeof SUPPORTED_DO_REGIONS)[number] {
+    const matchedRegion = SUPPORTED_DO_REGIONS.find((supportedRegion) => supportedRegion === region);
+    return matchedRegion ?? 'nyc3';
+  }
+
+  private toJsonObject(outputs: PulumiStackOutputs): Prisma.JsonObject {
+    const json: Prisma.JsonObject = {
+      appUrl: outputs.appUrl,
+      appId: outputs.appId,
+      repositoryUrl: outputs.repositoryUrl,
+    };
+
+    if (outputs.dbClusterName) {
+      json.dbClusterName = outputs.dbClusterName;
+    }
+    if (outputs.dbUri) {
+      json.dbUri = outputs.dbUri;
+    }
+    if (outputs.bucketName) {
+      json.bucketName = outputs.bucketName;
+    }
+    if (outputs.bucketEndpoint) {
+      json.bucketEndpoint = outputs.bucketEndpoint;
+    }
+
+    return json;
+  }
+
+  private resolveErrorMessage(error: unknown): string {
+    if (error instanceof Error) {
+      return this.sanitizeErrorMessage(error.message);
+    }
+    return 'Infrastructure processing failed';
+  }
+
+  private sanitizeErrorMessage(message: string): string {
+    const withoutDoToken = message.replace(/dop_v1_[A-Za-z0-9]+/g, '[REDACTED_DO_TOKEN]');
+    const withoutBearer = withoutDoToken.replace(/Bearer\s+[A-Za-z0-9._-]+/gi, 'Bearer [REDACTED]');
+    return withoutBearer.length > 500 ? withoutBearer.slice(0, 500) : withoutBearer;
+  }
+}
