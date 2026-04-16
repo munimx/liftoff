@@ -4,6 +4,7 @@ import { DoApiService } from './do-api.service';
 
 type HttpServiceMock = {
   get: jest.Mock;
+  post: jest.Mock;
 };
 
 /**
@@ -14,6 +15,7 @@ describe('DoApiService', () => {
 
   const httpServiceMock: HttpServiceMock = {
     get: jest.fn(),
+    post: jest.fn(),
   };
 
   const prismaServiceMock = {
@@ -78,5 +80,71 @@ describe('DoApiService', () => {
 
     expect(phase).toBe('ACTIVE');
     expect(prismaServiceMock.dOAccount.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('returns existing registry name when user already has a registry', async () => {
+    httpServiceMock.get.mockReturnValue(
+      of({
+        data: {
+          registry: {
+            name: 'existing-registry',
+          },
+        },
+      }),
+    );
+
+    const registryName = await service.getOrCreateContainerRegistryName('dop_v1_token', 'do-account-1');
+
+    expect(registryName).toBe('existing-registry');
+    expect(httpServiceMock.post).not.toHaveBeenCalled();
+  });
+
+  it('creates a registry when GET /v2/registry returns 404', async () => {
+    httpServiceMock.get.mockReturnValue(throwError(() => ({ response: { status: 404 } })));
+    httpServiceMock.post.mockReturnValue(
+      of({
+        data: {
+          registry: {
+            name: 'liftoff-abc123',
+          },
+        },
+      }),
+    );
+
+    const registryName = await service.getOrCreateContainerRegistryName('dop_v1_token', 'do-account-1');
+
+    expect(registryName).toBe('liftoff-abc123');
+    expect(httpServiceMock.post).toHaveBeenCalledWith(
+      'https://api.digitalocean.com/v2/registry',
+      expect.objectContaining({
+        name: expect.stringMatching(/^liftoff-[a-f0-9]{10}$/),
+        subscription_tier_slug: 'starter',
+      }),
+      expect.objectContaining({
+        headers: {
+          Authorization: 'Bearer dop_v1_token',
+        },
+      }),
+    );
+  });
+
+  it('retries registry creation on 422 name collisions', async () => {
+    httpServiceMock.get.mockReturnValue(throwError(() => ({ response: { status: 404 } })));
+    httpServiceMock.post
+      .mockReturnValueOnce(throwError(() => ({ response: { status: 422 } })))
+      .mockReturnValueOnce(
+        of({
+          data: {
+            registry: {
+              name: 'liftoff-final',
+            },
+          },
+        }),
+      );
+
+    const registryName = await service.getOrCreateContainerRegistryName('dop_v1_token');
+
+    expect(registryName).toBe('liftoff-final');
+    expect(httpServiceMock.post).toHaveBeenCalledTimes(2);
   });
 });

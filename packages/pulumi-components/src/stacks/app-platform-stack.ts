@@ -14,7 +14,6 @@ export interface AppPlatformStackArgs {
   environmentId: string;
   doRegion: string;
   doToken: string;
-  docrName: string;
   imageUri: string;
   config: LiftoffConfig;
 }
@@ -36,13 +35,14 @@ export function createAppPlatformStack(args: AppPlatformStackArgs): StackOutputs
   const provider = new digitalocean.Provider('user-account', {
     token: args.doToken,
   });
+  const registryName = resolveRegistryNameFromImageUri(args.imageUri);
 
   const registry = new DocrRepository(
     'registry',
     {
       projectName: args.projectName,
       environmentName: args.environmentName,
-      docrName: args.docrName,
+      docrName: registryName,
       provider,
     },
     { provider },
@@ -128,4 +128,15 @@ export function createAppPlatformStack(args: AppPlatformStackArgs): StackOutputs
   };
 
   return outputs;
+}
+
+function resolveRegistryNameFromImageUri(imageUri: string): string {
+  const match = /^registry\.digitalocean\.com\/([^/]+)\//.exec(imageUri);
+  if (!match?.[1]) {
+    throw new Error(
+      `Invalid image URI "${imageUri}". Expected registry.digitalocean.com/{registry}/{repository}:{tag}`,
+    );
+  }
+
+  return match[1];
 }

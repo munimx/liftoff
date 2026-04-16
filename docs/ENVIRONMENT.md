@@ -77,9 +77,7 @@ DO Spaces is S3-compatible object storage. Pulumi uses it to store infrastructur
 
 ### DigitalOcean Container Registry
 
-| Variable | Example | Description |
-|----------|---------|-------------|
-| `DOCR_NAME` | `liftoff` | Your DO Container Registry name (the part before `.registry.digitalocean.com`) |
+Container registry names for user deployments are provisioned automatically per user account (`liftoff-{randomHex}`) and do not require a static env var.
 
 ### Encryption
 
@@ -178,5 +176,4 @@ Use these exact names — no aliases:
 | Spaces endpoint | `DO_SPACES_ENDPOINT` |
 | Spaces region | `DO_SPACES_REGION` |
 | Pulumi passphrase | `PULUMI_PASSPHRASE` (subprocess uses `PULUMI_CONFIG_PASSPHRASE` internally) |
-| Container registry name | `DOCR_NAME` |
 | Encryption key | `ENCRYPTION_KEY` |

@@ -50,7 +50,6 @@ import { WebhooksModule } from './webhooks/webhooks.module';
         DO_SPACES_BUCKET: Joi.string().required(),
         DO_SPACES_ENDPOINT: Joi.string().uri().required(),
         DO_SPACES_REGION: Joi.string().required(),
-        DOCR_NAME: Joi.string().required(),
         PULUMI_PASSPHRASE: Joi.string().required(),
         ENCRYPTION_KEY: Joi.string().length(64).required(),
         THROTTLE_TTL: Joi.number().default(60000),

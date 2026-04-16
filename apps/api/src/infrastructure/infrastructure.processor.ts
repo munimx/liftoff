@@ -10,12 +10,12 @@ import {
   ErrorCodes,
   safeParseLiftoffConfig,
 } from '@liftoff/shared';
-import { ConfigService } from '@nestjs/config';
 import { Injectable, Logger } from '@nestjs/common';
 import type { Job } from 'bullmq';
 import * as yaml from 'js-yaml';
 import { Exceptions } from '../common/exceptions/app.exception';
 import { EncryptionService } from '../common/services/encryption.service';
+import { DoApiService } from '../do-api/do-api.service';
 import { EventsGateway } from '../events/events.gateway';
 import { PrismaService } from '../prisma/prisma.service';
 import {
@@ -50,6 +50,7 @@ type DeploymentWithEnvironment = Deployment & {
 
 type EnvironmentWithProvisioningData = {
   id: string;
+  doAccountId: string;
   name: string;
   configYaml: string | null;
   configParsed: Prisma.JsonValue | null;
@@ -93,8 +94,8 @@ export class InfrastructureProcessor extends WorkerHost {
 
   public constructor(
     private readonly prismaService: PrismaService,
-    private readonly configService: ConfigService,
     private readonly encryptionService: EncryptionService,
+    private readonly doApiService: DoApiService,
     private readonly pulumiRunnerService: PulumiRunnerService,
     private readonly eventsGateway: EventsGateway,
   ) {
@@ -127,7 +128,6 @@ export class InfrastructureProcessor extends WorkerHost {
     const stateSpacesKey = this.buildStateSpacesKey(stackName);
     const doToken = this.decryptDoToken(deployment.environment.doAccount.doToken);
     const config = this.parseLiftoffConfig(job.data.configYaml);
-    const docrName = this.configService.getOrThrow<string>('DOCR_NAME');
 
     await this.prismaService.deployment.update({
       where: { id: deployment.id },
@@ -146,7 +146,6 @@ export class InfrastructureProcessor extends WorkerHost {
       environmentId: deployment.environment.id,
       doRegion: deployment.environment.doAccount.region,
       doToken,
-      docrName,
       imageUri: job.data.imageUri,
       config,
     };
@@ -265,12 +264,11 @@ export class InfrastructureProcessor extends WorkerHost {
   private async handleDestroy(job: Job<InfraDestroyJobPayload>): Promise<void> {
     const environment = await this.getEnvironmentForDestroy(job.data.environmentId);
     const doToken = this.decryptDoToken(environment.doAccount.doToken);
-    const docrName = this.configService.getOrThrow<string>('DOCR_NAME');
     const stackName =
       environment.pulumiStack?.stackName ??
       this.buildStackName(environment.project.id, environment.name);
     const config = this.resolveDestroyConfig(environment);
-    const imageUri = this.resolveImageUri(environment, docrName);
+    const imageUri = await this.resolveImageUri(environment, doToken);
 
     const stackArgs: AppPlatformStackArgs = {
       projectName: environment.project.name,
@@ -279,7 +277,6 @@ export class InfrastructureProcessor extends WorkerHost {
       environmentId: environment.id,
       doRegion: environment.doAccount.region,
       doToken,
-      docrName,
       imageUri,
       config,
     };
@@ -353,6 +350,7 @@ export class InfrastructureProcessor extends WorkerHost {
       },
       select: {
         id: true,
+        doAccountId: true,
         name: true,
         configYaml: true,
         configParsed: true,
@@ -444,13 +442,20 @@ export class InfrastructureProcessor extends WorkerHost {
     };
   }
 
-  private resolveImageUri(environment: EnvironmentWithProvisioningData, docrName: string): string {
+  private async resolveImageUri(
+    environment: EnvironmentWithProvisioningData,
+    doToken: string,
+  ): Promise<string> {
     const latestImageUri = environment.deployments[0]?.imageUri;
     if (latestImageUri) {
       return latestImageUri;
     }
 
-    return `registry.digitalocean.com/${docrName}/${environment.project.name}/${environment.name}:latest`;
+    const registryName = await this.doApiService.getOrCreateContainerRegistryName(
+      doToken,
+      environment.doAccountId,
+    );
+    return `registry.digitalocean.com/${registryName}/${environment.project.name}/${environment.name}:latest`;
   }
 
   private decryptDoToken(encryptedToken: string): string {

@@ -1,7 +1,7 @@
 import { Role } from '@prisma/client';
 import { Queue } from 'bullmq';
-import { ConfigService } from '@nestjs/config';
 import { EncryptionService } from '../common/services/encryption.service';
+import { DoApiService } from '../do-api/do-api.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { JOB_NAMES } from '../queues/queue.constants';
 import { ProjectsService } from '../projects/projects.service';
@@ -22,6 +22,7 @@ runtime:
 
 const buildEnvironmentContext = () => ({
   id: 'env-1',
+  doAccountId: 'do-1',
   name: 'production',
   configYaml: validConfigYaml,
   configParsed: null,
@@ -59,12 +60,12 @@ describe('InfrastructureService', () => {
     assertProjectRole: jest.fn(),
   };
 
-  const configServiceMock = {
-    getOrThrow: jest.fn((_key: string) => 'liftoff'),
-  };
-
   const encryptionServiceMock = {
     decrypt: jest.fn((_encrypted: string) => 'dop_v1_real_token'),
+  };
+
+  const doApiServiceMock = {
+    getOrCreateContainerRegistryName: jest.fn(),
   };
 
   const pulumiRunnerServiceMock = {
@@ -81,8 +82,8 @@ describe('InfrastructureService', () => {
     service = new InfrastructureService(
       prismaServiceMock as unknown as PrismaService,
       projectsServiceMock as unknown as ProjectsService,
-      configServiceMock as unknown as ConfigService,
       encryptionServiceMock as unknown as EncryptionService,
+      doApiServiceMock as unknown as DoApiService,
       pulumiRunnerServiceMock as unknown as PulumiRunnerService,
       infrastructureQueueMock as unknown as Queue,
     );

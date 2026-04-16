@@ -1,5 +1,6 @@
 import { Repository, Role } from '@prisma/client';
 import {
+  DIGITALOCEAN_ACCESS_TOKEN_SECRET_NAME,
   ErrorCodes,
   resolveEnvironmentDeploySecretName,
   safeParseLiftoffConfig,
@@ -21,6 +22,7 @@ type ProjectEnvironmentSummary = {
   id: string;
   name: string;
   gitBranch: string;
+  doAccountId: string;
   liftoffDeploySecret: string | null;
   configParsed: unknown;
 };
@@ -105,6 +107,7 @@ export class RepositoriesService implements OnModuleInit {
         ErrorCodes.ENVIRONMENT_NOT_FOUND,
       );
     }
+    const doToken = await this.getDecryptedDoTokenForDoAccount(targetEnvironment.doAccountId, userId);
 
     const webhookSecret = randomBytes(20).toString('hex');
     const encryptedWebhookSecret = this.encryptionService.encrypt(webhookSecret);
@@ -166,25 +169,39 @@ export class RepositoriesService implements OnModuleInit {
     }
 
     try {
-      for (const environmentSecret of environmentSecrets) {
-        await this.githubService.upsertActionsSecret(
-          githubToken,
-          dto.fullName,
-          resolveEnvironmentDeploySecretName(environmentSecret.environmentId),
-          environmentSecret.plainSecret,
+      const targetEnvironmentSecret = environmentSecrets.find(
+        (environmentSecret) => environmentSecret.environmentId === targetEnvironment.id,
+      );
+      if (!targetEnvironmentSecret) {
+        throw Exceptions.internalError(
+          'Failed to resolve deploy secret for target environment',
+          ErrorCodes.INTERNAL_ERROR,
         );
       }
 
-      const workflowContent = this.workflowGeneratorService.generate({
+      await this.githubService.upsertActionsSecret(
+        githubToken,
+        dto.fullName,
+        resolveEnvironmentDeploySecretName(targetEnvironment.id),
+        targetEnvironmentSecret.plainSecret,
+      );
+      await this.githubService.upsertActionsSecret(
+        githubToken,
+        dto.fullName,
+        DIGITALOCEAN_ACCESS_TOKEN_SECRET_NAME,
+        doToken,
+      );
+
+      const workflowContent = await this.workflowGeneratorService.generate({
         projectName: project.name,
         environmentId: targetEnvironment.id,
         branch: dto.branch,
-        docrName: this.configService.getOrThrow<string>('DOCR_NAME'),
         imageRepository: `${project.name}/${targetEnvironment.name}`,
         liftoffApiUrl: this.getWebhookBaseUrl(),
         dockerfilePath: this.resolveDockerfilePath(targetEnvironment.configParsed),
         dockerBuildContext: this.resolveDockerBuildContext(targetEnvironment.configParsed),
-        deploySecretName: resolveEnvironmentDeploySecretName(targetEnvironment.id),
+        doToken,
+        doAccountId: targetEnvironment.doAccountId,
       });
 
       await this.githubService.commitFile(
@@ -203,6 +220,7 @@ export class RepositoriesService implements OnModuleInit {
         },
       });
 
+      this.logGitHubSetupErrorResponse(error);
       throw this.resolveRepositorySetupError(error);
     }
 
@@ -310,10 +328,9 @@ export class RepositoriesService implements OnModuleInit {
     return [
       'chore: add Liftoff deploy workflow',
       '',
-      'Required GitHub Secrets:',
+      'Managed GitHub Secrets (auto-upserted by Liftoff):',
+      '- LIFTOFF_DEPLOY_SECRET',
       '- DIGITALOCEAN_ACCESS_TOKEN',
-      '',
-      'LIFTOFF_DEPLOY_SECRET_<ENVIRONMENT_ID> is managed automatically by Liftoff.',
     ].join('\n');
   }
 
@@ -338,6 +355,7 @@ export class RepositoriesService implements OnModuleInit {
             id: true,
             name: true,
             gitBranch: true,
+            doAccountId: true,
             liftoffDeploySecret: true,
             configParsed: true,
           },
@@ -542,6 +560,38 @@ export class RepositoriesService implements OnModuleInit {
     }
   }
 
+  private async getDecryptedDoTokenForDoAccount(doAccountId: string, userId: string): Promise<string> {
+    const doAccount = await this.prismaService.dOAccount.findFirst({
+      where: {
+        id: doAccountId,
+        userId,
+      },
+      select: {
+        doToken: true,
+      },
+    });
+
+    if (!doAccount) {
+      throw Exceptions.badRequest(
+        'DigitalOcean account for this environment could not be found',
+        ErrorCodes.DO_ACCOUNT_NOT_FOUND,
+      );
+    }
+
+    return this.decryptDoToken(doAccount.doToken);
+  }
+
+  private decryptDoToken(encryptedDoToken: string): string {
+    try {
+      return this.encryptionService.decrypt(encryptedDoToken);
+    } catch {
+      throw Exceptions.internalError(
+        'Stored DigitalOcean token cannot be decrypted',
+        ErrorCodes.DO_ACCOUNT_VALIDATION_FAILED,
+      );
+    }
+  }
+
   private async deleteWebhookIfPresent(
     githubToken: string,
     fullName: string,
@@ -612,6 +662,24 @@ export class RepositoriesService implements OnModuleInit {
 
     const responseMessage = maybeError.response?.data?.message;
     return typeof responseMessage === 'string' ? responseMessage : null;
+  }
+
+  private logGitHubSetupErrorResponse(error: unknown): void {
+    if (!error || typeof error !== 'object') {
+      return;
+    }
+
+    const maybeError = error as {
+      response?: {
+        data?: unknown;
+      };
+    };
+    const responseData = maybeError.response?.data;
+    if (typeof responseData === 'undefined') {
+      return;
+    }
+
+    console.log('GitHub repository setup error response:', responseData);
   }
 
   private resolveHttpStatus(error: unknown): number | null {

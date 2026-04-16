@@ -9,7 +9,6 @@ export interface AppPlatformStackArgs {
   environmentId: string;
   doRegion: string;
   doToken: string;
-  docrName: string;
   imageUri: string;
   config: LiftoffConfig;
 }

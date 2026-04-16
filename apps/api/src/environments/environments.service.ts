@@ -1,4 +1,5 @@
 import {
+  DOAccount,
   Environment,
   Prisma,
   Role,
@@ -6,7 +7,9 @@ import {
 } from '@prisma/client';
 import { randomBytes } from 'node:crypto';
 import {
+  DIGITALOCEAN_ACCESS_TOKEN_SECRET_NAME,
   ErrorCodes,
+  type LiftoffConfig,
   resolveEnvironmentDeploySecretName,
   safeParseLiftoffConfig,
 } from '@liftoff/shared';
@@ -87,10 +90,11 @@ export class EnvironmentsService {
     dto: CreateEnvironmentDto,
   ): Promise<Environment> {
     await this.projectsService.assertProjectRole(projectId, userId, [Role.OWNER, Role.ADMIN]);
-    await this.assertDoAccountOwnership(dto.doAccountId, userId);
+    const doAccount = await this.assertDoAccountOwnership(dto.doAccountId, userId);
 
     const generatedDeploySecret = randomBytes(10).toString('hex');
     const liftoffDeploySecret = this.encryptionService.encrypt(generatedDeploySecret);
+    const defaultConfig = this.buildDefaultEnvironmentConfig();
 
     let createdEnvironment: Environment;
     try {
@@ -102,6 +106,8 @@ export class EnvironmentsService {
           gitBranch: dto.gitBranch,
           liftoffDeploySecret,
           serviceType: this.toPrismaServiceType(dto.serviceType),
+          configYaml: defaultConfig.configYaml,
+          configParsed: defaultConfig.configParsed,
         },
       });
     } catch (error) {
@@ -115,10 +121,11 @@ export class EnvironmentsService {
     }
 
     try {
-      await this.syncRepositoryDeploySecretIfConnected(
+      await this.syncRepositoryActionsSecretsIfConnected(
         projectId,
         createdEnvironment.id,
         generatedDeploySecret,
+        doAccount.doToken,
       );
     } catch (error) {
       await this.prismaService.environment.delete({
@@ -334,7 +341,10 @@ export class EnvironmentsService {
     return environment;
   }
 
-  private async assertDoAccountOwnership(doAccountId: string, userId: string): Promise<void> {
+  private async assertDoAccountOwnership(
+    doAccountId: string,
+    userId: string,
+  ): Promise<Pick<DOAccount, 'id' | 'doToken'>> {
     const doAccount = await this.prismaService.dOAccount.findFirst({
       where: {
         id: doAccountId,
@@ -342,6 +352,7 @@ export class EnvironmentsService {
       },
       select: {
         id: true,
+        doToken: true,
       },
     });
 
@@ -351,12 +362,45 @@ export class EnvironmentsService {
         ErrorCodes.DO_ACCOUNT_NOT_FOUND,
       );
     }
+
+    return doAccount;
   }
 
-  private async syncRepositoryDeploySecretIfConnected(
+  private buildDefaultEnvironmentConfig(): { configYaml: string; configParsed: LiftoffConfig } {
+    const configYaml = [
+      'version: "1.0"',
+      'service:',
+      '  name: test-app',
+      '  type: app',
+      '  region: nyc3',
+      'runtime:',
+      '  instance_size: apps-s-1vcpu-0.5gb',
+      '  port: 3000',
+      '  replicas: 1',
+      'healthcheck:',
+      '  path: /',
+    ].join('\n');
+    const parsedYaml = yaml.load(configYaml);
+
+    const parsedConfig = safeParseLiftoffConfig(parsedYaml);
+    if (!parsedConfig.success) {
+      throw Exceptions.internalError(
+        'Failed to generate default environment configuration',
+        ErrorCodes.INTERNAL_ERROR,
+      );
+    }
+
+    return {
+      configYaml,
+      configParsed: parsedConfig.data,
+    };
+  }
+
+  private async syncRepositoryActionsSecretsIfConnected(
     projectId: string,
     environmentId: string,
     deploySecret: string,
+    encryptedDoToken: string,
   ): Promise<void> {
     const projectRepositoryContext = await this.prismaService.project.findFirst({
       where: {
@@ -391,6 +435,7 @@ export class EnvironmentsService {
 
     const githubToken = this.decryptGitHubToken(encryptedGithubToken);
     const deploySecretName = resolveEnvironmentDeploySecretName(environmentId);
+    const doToken = this.decryptDoToken(encryptedDoToken);
 
     try {
       await this.githubService.upsertActionsSecret(
@@ -399,8 +444,14 @@ export class EnvironmentsService {
         deploySecretName,
         deploySecret,
       );
+      await this.githubService.upsertActionsSecret(
+        githubToken,
+        projectRepositoryContext.repository.fullName,
+        DIGITALOCEAN_ACCESS_TOKEN_SECRET_NAME,
+        doToken,
+      );
     } catch (error) {
-      throw this.resolveDeploySecretSyncError(error);
+      throw this.resolveActionsSecretSyncError(error);
     }
   }
 
@@ -415,7 +466,18 @@ export class EnvironmentsService {
     }
   }
 
-  private resolveDeploySecretSyncError(error: unknown): AppException {
+  private decryptDoToken(encryptedDoToken: string): string {
+    try {
+      return this.encryptionService.decrypt(encryptedDoToken);
+    } catch {
+      throw Exceptions.internalError(
+        'Stored DigitalOcean token cannot be decrypted',
+        ErrorCodes.DO_ACCOUNT_VALIDATION_FAILED,
+      );
+    }
+  }
+
+  private resolveActionsSecretSyncError(error: unknown): AppException {
     const statusCode = this.resolveHttpStatus(error);
     const errorMessage = this.resolveGitHubErrorMessage(error)?.toLowerCase() ?? '';
 
@@ -434,14 +496,14 @@ export class EnvironmentsService {
 
     if (statusCode === HttpStatus.NOT_FOUND || statusCode === HttpStatus.FORBIDDEN) {
       return new AppException(
-        'Repository access was denied while configuring the deploy secret.',
+        'Repository access was denied while configuring deployment secrets.',
         HttpStatus.BAD_REQUEST,
         ErrorCodes.REPOSITORY_ACCESS_DENIED,
       );
     }
 
     return new AppException(
-      'Failed to configure GitHub Actions deploy secret for this environment',
+      'Failed to configure GitHub Actions secrets for this environment',
       HttpStatus.BAD_GATEWAY,
       ErrorCodes.INTERNAL_ERROR,
     );

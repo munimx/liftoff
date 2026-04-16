@@ -136,6 +136,7 @@ describe('WebhooksService', () => {
     prismaServiceMock.environment.findFirst.mockResolvedValue({
       id: 'env-1',
       configYaml: 'version: "1.0"',
+      configParsed: null,
       liftoffDeploySecret: 'encrypted-deploy-secret',
     });
     encryptionServiceMock.decrypt.mockReturnValue('deploy-secret');
@@ -189,5 +190,40 @@ describe('WebhooksService', () => {
         timeout: QUEUE_TIMEOUTS.DEPLOYMENT_JOB_TIMEOUT_MS,
       }),
     );
+  });
+
+  it('handleDeployComplete marks deployment as failed when environment config is missing', async () => {
+    prismaServiceMock.environment.findFirst.mockResolvedValue({
+      id: 'env-1',
+      configYaml: null,
+      configParsed: null,
+      liftoffDeploySecret: 'encrypted-deploy-secret',
+    });
+    encryptionServiceMock.decrypt.mockReturnValue('deploy-secret');
+    prismaServiceMock.deployment.findFirst.mockResolvedValue({
+      id: 'deployment-1',
+    });
+    prismaServiceMock.deployment.update.mockResolvedValue(undefined);
+
+    await expect(
+      service.handleDeployComplete(
+        {
+          environmentId: 'env-1',
+          imageUri: 'registry.digitalocean.com/liftoff/my-app/production:abc123',
+          commitSha: 'abc123',
+        },
+        'deploy-secret',
+      ),
+    ).rejects.toThrow('Environment configuration is missing');
+
+    expect(prismaServiceMock.deployment.update).toHaveBeenCalledWith({
+      where: { id: 'deployment-1' },
+      data: {
+        status: DeploymentStatus.FAILED,
+        errorMessage: 'Environment configuration is missing',
+        completedAt: expect.any(Date),
+      },
+    });
+    expect(infrastructureQueueMock.add).not.toHaveBeenCalled();
   });
 });

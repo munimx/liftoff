@@ -1,4 +1,6 @@
 import { Injectable } from '@nestjs/common';
+import { LIFTOFF_DEPLOY_SECRET_NAME } from '@liftoff/shared';
+import { DoApiService } from '../do-api/do-api.service';
 
 /**
  * Workflow generation configuration.
@@ -7,12 +9,12 @@ export interface GenerateWorkflowConfig {
   projectName: string;
   environmentId: string;
   branch: string;
-  docrName: string;
   imageRepository: string;
   liftoffApiUrl: string;
   dockerfilePath: string;
   dockerBuildContext: string;
-  deploySecretName: string;
+  doToken: string;
+  doAccountId?: string;
 }
 
 /**
@@ -20,18 +22,23 @@ export interface GenerateWorkflowConfig {
  */
 @Injectable()
 export class WorkflowGeneratorService {
+  public constructor(private readonly doApiService: DoApiService) {}
+
   /**
    * Returns workflow YAML content for `.github/workflows/liftoff-deploy.yml`.
    */
-  public generate(config: GenerateWorkflowConfig): string {
+  public async generate(config: GenerateWorkflowConfig): Promise<string> {
+    const registryName = await this.doApiService.getOrCreateContainerRegistryName(
+      config.doToken,
+      config.doAccountId,
+    );
     const branch = this.escapeYamlSingleQuoted(config.branch);
     const environmentId = this.escapeJsonString(config.environmentId);
     const imageRepository = this.escapeJsonString(config.imageRepository);
-    const docrName = this.escapeJsonString(config.docrName);
+    const docrName = this.escapeJsonString(registryName);
     const liftoffApiUrl = this.trimTrailingSlash(config.liftoffApiUrl);
     const dockerfilePath = this.escapeJsonString(config.dockerfilePath);
     const dockerBuildContext = this.escapeJsonString(config.dockerBuildContext);
-    const deploySecretName = this.escapeGitHubSecretName(config.deploySecretName);
 
     return `name: Liftoff Deploy
 
@@ -68,7 +75,7 @@ jobs:
           IMAGE_TAG: \${{ github.sha }}
         run: |
           curl -X POST ${liftoffApiUrl}/api/v1/webhooks/deploy-complete \\
-            -H "X-Liftoff-Secret: \${{ secrets.${deploySecretName} }}" \\
+            -H "X-Liftoff-Secret: \${{ secrets.${LIFTOFF_DEPLOY_SECRET_NAME} }}" \\
             -H "Content-Type: application/json" \\
             -d "{\\"environmentId\\":\\"${environmentId}\\",\\"imageUri\\":\\"registry.digitalocean.com/${docrName}/${imageRepository}:$IMAGE_TAG\\",\\"commitSha\\":\\"$GITHUB_SHA\\"}"
 `;
@@ -84,9 +91,5 @@ jobs:
 
   private escapeJsonString(value: string): string {
     return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-  }
-
-  private escapeGitHubSecretName(value: string): string {
-    return value.replace(/[^A-Z0-9_]/g, '_');
   }
 }

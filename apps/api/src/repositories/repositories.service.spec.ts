@@ -1,5 +1,8 @@
 import { Role } from '@prisma/client';
-import { resolveEnvironmentDeploySecretName } from '@liftoff/shared';
+import {
+  DIGITALOCEAN_ACCESS_TOKEN_SECRET_NAME,
+  resolveEnvironmentDeploySecretName,
+} from '@liftoff/shared';
 import { ConfigService } from '@nestjs/config';
 import { EncryptionService } from '../common/services/encryption.service';
 import { PrismaService } from '../prisma/prisma.service';
@@ -31,6 +34,9 @@ describe('RepositoriesService', () => {
       findMany: jest.fn(),
       update: jest.fn(),
       delete: jest.fn(),
+    },
+    dOAccount: {
+      findFirst: jest.fn(),
     },
     user: {
       findFirst: jest.fn(),
@@ -65,17 +71,13 @@ describe('RepositoriesService', () => {
   };
 
   const workflowGeneratorServiceMock = {
-    generate: jest.fn(() => 'workflow-content'),
+    generate: jest.fn().mockResolvedValue('workflow-content'),
   };
 
   const configServiceMock = {
     getOrThrow: jest.fn((key: string) => {
       if (key === 'WEBHOOK_BASE_URL') {
         return 'https://liftoff.example.com';
-      }
-
-      if (key === 'DOCR_NAME') {
-        return 'liftoff';
       }
 
       return '';
@@ -88,6 +90,9 @@ describe('RepositoriesService', () => {
       async (callback: (transaction: typeof transactionMock) => Promise<unknown>) =>
         callback(transactionMock),
     );
+    prismaServiceMock.dOAccount.findFirst.mockResolvedValue({
+      doToken: 'encrypted-do-token',
+    });
 
     service = new RepositoriesService(
       prismaServiceMock as unknown as PrismaService,
@@ -120,6 +125,7 @@ describe('RepositoriesService', () => {
           id: 'env-1',
           name: 'production',
           gitBranch: 'main',
+          doAccountId: 'do-1',
           liftoffDeploySecret: null,
           configParsed: null,
         },
@@ -158,26 +164,34 @@ describe('RepositoriesService', () => {
       projectName: 'my-app',
       environmentId: 'env-1',
       branch: 'main',
-      docrName: 'liftoff',
       imageRepository: 'my-app/production',
       liftoffApiUrl: 'https://liftoff.example.com',
       dockerfilePath: 'Dockerfile',
       dockerBuildContext: '.',
-      deploySecretName: resolveEnvironmentDeploySecretName('env-1'),
+      doToken: 'decrypted-value',
+      doAccountId: 'do-1',
     });
     expect(githubServiceMock.commitFile).toHaveBeenCalledWith(
       'decrypted-value',
       'liftoff/my-app',
       '.github/workflows/liftoff-deploy.yml',
       'workflow-content',
-      expect.stringContaining('Required GitHub Secrets'),
+      expect.stringContaining('Managed GitHub Secrets'),
       'main',
     );
-    expect(githubServiceMock.upsertActionsSecret).toHaveBeenCalledWith(
+    expect(githubServiceMock.upsertActionsSecret).toHaveBeenNthCalledWith(
+      1,
       'decrypted-value',
       'liftoff/my-app',
       resolveEnvironmentDeploySecretName('env-1'),
       expect.stringMatching(/^[0-9a-f]{40}$/),
+    );
+    expect(githubServiceMock.upsertActionsSecret).toHaveBeenNthCalledWith(
+      2,
+      'decrypted-value',
+      'liftoff/my-app',
+      DIGITALOCEAN_ACCESS_TOKEN_SECRET_NAME,
+      'decrypted-value',
     );
     expect(result.fullName).toBe('liftoff/my-app');
     expect(result.branch).toBe('main');
@@ -185,6 +199,7 @@ describe('RepositoriesService', () => {
   });
 
   it('connect returns actionable error when workflow scope is missing', async () => {
+    const consoleLogSpy = jest.spyOn(console, 'log').mockImplementation(() => undefined);
     projectsServiceMock.assertProjectRole.mockResolvedValue(Role.OWNER);
     prismaServiceMock.repository.findUnique.mockResolvedValue(null);
     prismaServiceMock.user.findFirst.mockResolvedValue({ githubToken: 'encrypted-github-token' });
@@ -205,6 +220,7 @@ describe('RepositoriesService', () => {
           id: 'env-1',
           name: 'production',
           gitBranch: 'main',
+          doAccountId: 'do-1',
           liftoffDeploySecret: null,
           configParsed: null,
         },
@@ -243,6 +259,9 @@ describe('RepositoriesService', () => {
         branch: 'main',
       }),
     ).rejects.toThrow('GitHub token is missing workflow/actions permissions');
+    expect(consoleLogSpy).toHaveBeenCalledWith('GitHub repository setup error response:', {
+      message: 'Resource not accessible by integration',
+    });
     expect(githubServiceMock.deleteWebhook).toHaveBeenCalledWith(
       'decrypted-value',
       'liftoff/my-app',
@@ -253,6 +272,7 @@ describe('RepositoriesService', () => {
         id: 'repo-1',
       },
     });
+    consoleLogSpy.mockRestore();
   });
 
   it('connect returns actionable error when Actions secret automation is denied', async () => {
@@ -276,6 +296,7 @@ describe('RepositoriesService', () => {
           id: 'env-1',
           name: 'production',
           gitBranch: 'main',
+          doAccountId: 'do-1',
           liftoffDeploySecret: null,
           configParsed: null,
         },
@@ -348,6 +369,7 @@ describe('RepositoriesService', () => {
           id: 'env-1',
           name: 'production',
           gitBranch: 'main',
+          doAccountId: 'do-1',
           liftoffDeploySecret: null,
           configParsed: {
             version: '1.0',

@@ -11,9 +11,9 @@ import {
 import { Queue } from 'bullmq';
 import * as yaml from 'js-yaml';
 import { Injectable } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
 import { Exceptions } from '../common/exceptions/app.exception';
 import { EncryptionService } from '../common/services/encryption.service';
+import { DoApiService } from '../do-api/do-api.service';
 import { PrismaService } from '../prisma/prisma.service';
 import {
   InfraDestroyJobPayload,
@@ -66,8 +66,8 @@ export class InfrastructureService {
   public constructor(
     private readonly prismaService: PrismaService,
     private readonly projectsService: ProjectsService,
-    private readonly configService: ConfigService,
     private readonly encryptionService: EncryptionService,
+    private readonly doApiService: DoApiService,
     private readonly pulumiRunnerService: PulumiRunnerService,
     @InjectQueue(QUEUE_NAMES.INFRASTRUCTURE)
     private readonly infrastructureQueue: Queue<InfraDestroyJobPayload>,
@@ -85,7 +85,7 @@ export class InfrastructureService {
 
     const config = this.resolveEnvironmentConfig(environment);
     const doToken = this.decryptDoToken(environment.doAccount.doToken);
-    const docrName = this.configService.getOrThrow<string>('DOCR_NAME');
+    const imageUri = await this.resolveImageUri(environment, doToken);
     const stackName = this.buildStackName(environment.project.id, environment.name);
 
     const stackArgs: AppPlatformStackArgs = {
@@ -95,8 +95,7 @@ export class InfrastructureService {
       environmentId: environment.id,
       doRegion: environment.doAccount.region,
       doToken,
-      docrName,
-      imageUri: this.resolveImageUri(environment, docrName),
+      imageUri,
       config,
     };
 
@@ -212,13 +211,20 @@ export class InfrastructureService {
     return parsedConfig.data;
   }
 
-  private resolveImageUri(environment: EnvironmentPreviewContext, docrName: string): string {
+  private async resolveImageUri(
+    environment: EnvironmentPreviewContext,
+    doToken: string,
+  ): Promise<string> {
     const latestImageUri = environment.deployments[0]?.imageUri;
     if (latestImageUri) {
       return latestImageUri;
     }
 
-    return `registry.digitalocean.com/${docrName}/${environment.project.name}/${environment.name}:preview`;
+    const registryName = await this.doApiService.getOrCreateContainerRegistryName(
+      doToken,
+      environment.doAccountId,
+    );
+    return `registry.digitalocean.com/${registryName}/${environment.project.name}/${environment.name}:preview`;
   }
 
   private decryptDoToken(encryptedToken: string): string {

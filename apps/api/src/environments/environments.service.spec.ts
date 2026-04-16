@@ -1,5 +1,10 @@
 import { Role, ServiceType } from '@prisma/client';
-import { resolveEnvironmentDeploySecretName } from '@liftoff/shared';
+import {
+  DIGITALOCEAN_ACCESS_TOKEN_SECRET_NAME,
+  resolveEnvironmentDeploySecretName,
+  safeParseLiftoffConfig,
+} from '@liftoff/shared';
+import * as yaml from 'js-yaml';
 import { EncryptionService } from '../common/services/encryption.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { ProjectsService } from '../projects/projects.service';
@@ -78,7 +83,10 @@ describe('EnvironmentsService', () => {
       serviceType: 'APP',
     };
     projectsServiceMock.assertProjectRole.mockResolvedValue(Role.OWNER);
-    prismaServiceMock.dOAccount.findFirst.mockResolvedValue({ id: 'do-1' });
+    prismaServiceMock.dOAccount.findFirst.mockResolvedValue({
+      id: 'do-1',
+      doToken: 'encrypted-do-token',
+    });
     prismaServiceMock.project.findFirst.mockResolvedValue({
       repository: null,
       user: {
@@ -94,11 +102,42 @@ describe('EnvironmentsService', () => {
     const createInput = prismaServiceMock.environment.create.mock.calls[0]?.[0];
     const encryptionInput = encryptionServiceMock.encrypt.mock.calls[0]?.[0];
     const persistedSecret = createInput?.data?.liftoffDeploySecret;
+    const persistedConfigYaml = createInput?.data?.configYaml;
+    const persistedConfigParsed = createInput?.data?.configParsed;
+    const parsedYaml = safeParseLiftoffConfig(yaml.load(String(persistedConfigYaml)));
+    const expectedDefaultConfigYaml = [
+      'version: "1.0"',
+      'service:',
+      '  name: test-app',
+      '  type: app',
+      '  region: nyc3',
+      'runtime:',
+      '  instance_size: apps-s-1vcpu-0.5gb',
+      '  port: 3000',
+      '  replicas: 1',
+      'healthcheck:',
+      '  path: /',
+    ].join('\n');
 
     expect(result.id).toBe('env-1');
     expect(encryptionInput).toEqual(expect.stringMatching(/^[0-9a-f]{20}$/));
     expect(persistedSecret).toBe(`encrypted:${encryptionInput}`);
     expect(result.liftoffDeploySecret).toBe(persistedSecret);
+    expect(persistedConfigYaml).toBe(expectedDefaultConfigYaml);
+    expect(parsedYaml.success).toBe(true);
+    expect(persistedConfigParsed).toEqual(
+      expect.objectContaining({
+        version: '1.0',
+        service: expect.objectContaining({
+          name: 'test-app',
+          type: 'app',
+          region: 'nyc3',
+        }),
+        runtime: expect.objectContaining({
+          port: 3000,
+        }),
+      }),
+    );
     expect(projectsServiceMock.assertProjectRole).toHaveBeenCalledWith('project-1', 'user-1', [
       Role.OWNER,
       Role.ADMIN,
@@ -111,6 +150,10 @@ describe('EnvironmentsService', () => {
         gitBranch: 'main',
         liftoffDeploySecret: expect.stringMatching(/^encrypted:[0-9a-f]{20}$/),
         serviceType: ServiceType.APP,
+        configYaml: expect.any(String),
+        configParsed: expect.objectContaining({
+          version: '1.0',
+        }),
       },
     });
     expect(githubServiceMock.upsertActionsSecret).not.toHaveBeenCalled();
@@ -124,7 +167,10 @@ describe('EnvironmentsService', () => {
       serviceType: 'APP',
     };
     projectsServiceMock.assertProjectRole.mockResolvedValue(Role.OWNER);
-    prismaServiceMock.dOAccount.findFirst.mockResolvedValue({ id: 'do-1' });
+    prismaServiceMock.dOAccount.findFirst.mockResolvedValue({
+      id: 'do-1',
+      doToken: 'encrypted-do-token',
+    });
     prismaServiceMock.project.findFirst.mockResolvedValue({
       repository: {
         fullName: 'liftoff/my-app',
@@ -142,11 +188,19 @@ describe('EnvironmentsService', () => {
     await service.create('project-1', 'user-1', dto);
 
     const generatedSecret = encryptionServiceMock.encrypt.mock.calls[0]?.[0];
-    expect(githubServiceMock.upsertActionsSecret).toHaveBeenCalledWith(
+    expect(githubServiceMock.upsertActionsSecret).toHaveBeenNthCalledWith(
+      1,
       'decrypted-github-token',
       'liftoff/my-app',
       resolveEnvironmentDeploySecretName('env-1'),
       generatedSecret,
+    );
+    expect(githubServiceMock.upsertActionsSecret).toHaveBeenNthCalledWith(
+      2,
+      'decrypted-github-token',
+      'liftoff/my-app',
+      DIGITALOCEAN_ACCESS_TOKEN_SECRET_NAME,
+      'decrypted-github-token',
     );
   });
 
@@ -158,7 +212,10 @@ describe('EnvironmentsService', () => {
       serviceType: 'APP',
     };
     projectsServiceMock.assertProjectRole.mockResolvedValue(Role.OWNER);
-    prismaServiceMock.dOAccount.findFirst.mockResolvedValue({ id: 'do-1' });
+    prismaServiceMock.dOAccount.findFirst.mockResolvedValue({
+      id: 'do-1',
+      doToken: 'encrypted-do-token',
+    });
     prismaServiceMock.project.findFirst.mockResolvedValue({
       repository: {
         fullName: 'liftoff/my-app',

@@ -1,9 +1,10 @@
 import { InjectQueue } from '@nestjs/bullmq';
 import { DeploymentStatus } from '@prisma/client';
-import { ACTIVE_STATUSES, ErrorCodes } from '@liftoff/shared';
+import { ACTIVE_STATUSES, ErrorCodes, safeParseLiftoffConfig } from '@liftoff/shared';
 import { HttpStatus, Injectable, Logger } from '@nestjs/common';
 import { Queue } from 'bullmq';
 import { timingSafeEqual } from 'crypto';
+import * as yaml from 'js-yaml';
 import { AppException, Exceptions } from '../common/exceptions/app.exception';
 import { EncryptionService } from '../common/services/encryption.service';
 import {
@@ -197,6 +198,7 @@ export class WebhooksService {
       select: {
         id: true,
         configYaml: true,
+        configParsed: true,
         liftoffDeploySecret: true,
       },
     });
@@ -242,7 +244,9 @@ export class WebhooksService {
       );
     }
 
-    if (!environment.configYaml) {
+    const resolvedConfigYaml = this.resolveConfigYaml(environment.configYaml, environment.configParsed);
+    if (!resolvedConfigYaml) {
+      await this.markDeploymentFailedForMissingConfig(deployment.id);
       throw Exceptions.badRequest(
         'Environment configuration is missing',
         ErrorCodes.CONFIG_MISSING_REQUIRED_FIELDS,
@@ -266,7 +270,7 @@ export class WebhooksService {
         deploymentId: deployment.id,
         environmentId: environment.id,
         imageUri: payload.imageUri,
-        configYaml: environment.configYaml,
+        configYaml: resolvedConfigYaml,
       },
       {
         attempts: 3,
@@ -285,6 +289,36 @@ export class WebhooksService {
         ErrorCodes.INTERNAL_ERROR,
       );
     }
+  }
+
+  private resolveConfigYaml(configYaml: string | null, configParsed: unknown): string | null {
+    if (configYaml) {
+      return configYaml;
+    }
+
+    if (configParsed === null) {
+      return null;
+    }
+
+    const parsedConfig = safeParseLiftoffConfig(configParsed);
+    if (!parsedConfig.success) {
+      return null;
+    }
+
+    return yaml.dump(parsedConfig.data);
+  }
+
+  private async markDeploymentFailedForMissingConfig(deploymentId: string): Promise<void> {
+    await this.prismaService.deployment.update({
+      where: {
+        id: deploymentId,
+      },
+      data: {
+        status: DeploymentStatus.FAILED,
+        errorMessage: 'Environment configuration is missing',
+        completedAt: new Date(),
+      },
+    });
   }
 
   private secretsMatch(providedSecret: string, expectedSecret: string): boolean {
