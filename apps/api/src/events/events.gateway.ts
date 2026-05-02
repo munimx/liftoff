@@ -61,8 +61,10 @@ export class EventsGateway implements OnGatewayConnection, OnGatewayDisconnect {
     try {
       const payload = await this.jwtService.verifyAsync(token);
       client.data.userId = payload.sub;
-    } catch {
-      this.logger.warn(`Socket ${client.id} failed JWT verification`);
+      this.logger.debug(`Socket ${client.id} authenticated with userId: ${payload.sub}`);
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      this.logger.warn(`Socket ${client.id} failed JWT verification: ${errorMessage}`);
       client.disconnect(true);
     }
   }

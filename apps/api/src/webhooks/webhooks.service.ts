@@ -38,6 +38,8 @@ export interface DeployCompletePayload {
   environmentId: string;
   imageUri: string;
   commitSha: string;
+  status?: string;
+  runUrl?: string;
 }
 
 /**
@@ -248,6 +250,20 @@ export class WebhooksService {
         'No deployment in QUEUED, BUILDING, or PUSHING state for this environment',
         ErrorCodes.DEPLOYMENT_NOT_FOUND,
       );
+    }
+
+    // If the GitHub Actions job failed, mark deployment as FAILED
+    if (payload.status && payload.status.toLowerCase() === 'failure') {
+      await this.prismaService.deployment.update({
+        where: { id: deployment.id },
+        data: {
+          status: DeploymentStatus.FAILED,
+          errorMessage: `Deployment failed during build/push phase. GitHub Actions run: ${payload.runUrl || 'unknown'}`,
+          completedAt: new Date(),
+        },
+      });
+      this.logger.warn(`Deployment ${deployment.id} failed with GitHub Actions status: failure`);
+      return;
     }
 
     const appContext = this.resolveAppContext(environment.pulumiStack?.outputs);

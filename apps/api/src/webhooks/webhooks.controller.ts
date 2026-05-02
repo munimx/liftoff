@@ -63,6 +63,8 @@ export class WebhooksController {
       environmentId: dto.environmentId,
       imageUri: dto.imageUri,
       commitSha: dto.commitSha,
+      status: dto.status,
+      runUrl: dto.runUrl,
     };
 
     await this.webhooksService.handleDeployComplete(payload, secretHeader);

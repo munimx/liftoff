@@ -7,9 +7,11 @@ import {
   type WsDeploymentLogPayload,
   type WsDeploymentStatusPayload,
 } from '@liftoff/shared';
+import { AlertCircle, ExternalLink } from 'lucide-react';
 import { useParams } from 'next/navigation';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { LogViewer, type DeploymentLogViewerEntry } from '@/components/deployments/log-viewer';
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
@@ -260,6 +262,35 @@ export default function DeploymentDetailsPage(): JSX.Element {
           </Button>
         ) : null}
       </div>
+
+      {deployment.status === 'FAILED' && deployment.errorMessage ? (
+        <Alert variant="destructive">
+          <AlertCircle className="h-4 w-4" />
+          <AlertTitle>Deployment Failed</AlertTitle>
+          <AlertDescription>
+            <p className="mb-2">{deployment.errorMessage}</p>
+            {deployment.errorMessage.toLowerCase().includes('push') && (
+              <div className="mb-3 space-y-2 rounded bg-background/50 p-3 text-sm">
+                <p className="font-medium">Troubleshooting tips:</p>
+                <ul className="ml-4 list-disc space-y-1 text-xs">
+                  <li>If using the free DigitalOcean Starter tier, you may have reached the 1-repository limit.</li>
+                  <li>Delete old images in your DigitalOcean dashboard or upgrade your Container Registry tier.</li>
+                </ul>
+              </div>
+            )}
+            {deployment.errorMessage.includes('github.com') || deployment.errorMessage.includes('actions/runs') ? (
+              <a
+                href={deployment.errorMessage.match(/https?:\/\/[^\s]+/)?.[0] || '#'}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1 text-xs font-medium text-blue-500 hover:text-blue-600"
+              >
+                View GitHub Actions run <ExternalLink className="h-3 w-3" />
+              </a>
+            ) : null}
+          </AlertDescription>
+        </Alert>
+      ) : null}
 
       <Card>
         <CardHeader>

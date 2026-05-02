@@ -280,4 +280,40 @@ describe('WebhooksService', () => {
     });
     expect(infrastructureQueueMock.add).not.toHaveBeenCalled();
   });
+
+  it('handleDeployComplete marks deployment as failed when GitHub Actions job fails', async () => {
+    prismaServiceMock.environment.findFirst.mockResolvedValue({
+      id: 'env-1',
+      configYaml: 'version: "1.0"',
+      configParsed: null,
+      liftoffDeploySecret: 'encrypted-deploy-secret',
+      pulumiStack: null,
+    });
+    encryptionServiceMock.decrypt.mockReturnValue('deploy-secret');
+    prismaServiceMock.deployment.findFirst.mockResolvedValue({
+      id: 'deployment-1',
+    });
+    prismaServiceMock.deployment.update.mockResolvedValue(undefined);
+
+    await service.handleDeployComplete(
+      {
+        environmentId: 'env-1',
+        imageUri: 'registry.digitalocean.com/liftoff/my-app/production:abc123',
+        commitSha: 'abc123',
+        status: 'failure',
+        runUrl: 'https://github.com/user/repo/actions/runs/123456',
+      },
+      'deploy-secret',
+    );
+
+    expect(prismaServiceMock.deployment.update).toHaveBeenCalledWith({
+      where: { id: 'deployment-1' },
+      data: {
+        status: DeploymentStatus.FAILED,
+        errorMessage: expect.stringContaining('Deployment failed during build/push phase'),
+        completedAt: expect.any(Date),
+      },
+    });
+    expect(infrastructureQueueMock.add).not.toHaveBeenCalled();
+  });
 });

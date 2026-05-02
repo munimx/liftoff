@@ -1,5 +1,5 @@
 import { ApiProperty } from '@nestjs/swagger';
-import { IsNotEmpty, IsString, Matches, MaxLength } from 'class-validator';
+import { IsNotEmpty, IsOptional, IsString, IsUrl, Matches, MaxLength } from 'class-validator';
 
 /**
  * Request payload for workflow deploy completion callbacks.
@@ -25,4 +25,19 @@ export class DeployCompleteDto {
   @MaxLength(64)
   @Matches(/^[a-f0-9]+$/i)
   public commitSha!: string;
+
+  @ApiProperty({ example: 'success', description: 'GitHub Actions job status' })
+  @IsString()
+  @IsOptional()
+  @Matches(/^(success|failure|cancelled)$/i)
+  public status?: string;
+
+  @ApiProperty({
+    example: 'https://github.com/user/repo/actions/runs/123456789',
+    description: 'URL to the GitHub Actions workflow run',
+  })
+  @IsString()
+  @IsOptional()
+  @IsUrl()
+  public runUrl?: string;
 }

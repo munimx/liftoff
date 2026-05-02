@@ -15,6 +15,7 @@ export interface GenerateWorkflowConfig {
   dockerBuildContext: string;
   doToken: string;
   doAccountId?: string;
+  githubRunsUrl?: string;
 }
 
 /**
@@ -66,18 +67,21 @@ jobs:
         run: |
           docker build \\
             -f ${dockerfilePath} \\
-            -t registry.digitalocean.com/${docrName}/${imageRepository}:$IMAGE_TAG \\
+            -t registry.digitalocean.com/${docrName}/${imageRepository}:\$IMAGE_TAG \\
             ${dockerBuildContext}
-          docker push registry.digitalocean.com/${docrName}/${imageRepository}:$IMAGE_TAG
+          docker push registry.digitalocean.com/${docrName}/${imageRepository}:\$IMAGE_TAG
 
       - name: Notify Liftoff
+        if: always()
         env:
           IMAGE_TAG: \${{ github.sha }}
+          JOB_STATUS: \${{ job.status }}
+          RUN_URL: \${{ github.server_url }}/\${{ github.repository }}/actions/runs/\${{ github.run_id }}
         run: |
           curl -X POST ${liftoffApiUrl}/api/v1/webhooks/deploy-complete \\
             -H "X-Liftoff-Secret: \${{ secrets.${LIFTOFF_DEPLOY_SECRET_NAME} }}" \\
             -H "Content-Type: application/json" \\
-            -d "{\\"environmentId\\":\\"${environmentId}\\",\\"imageUri\\":\\"registry.digitalocean.com/${docrName}/${imageRepository}:$IMAGE_TAG\\",\\"commitSha\\":\\"$GITHUB_SHA\\"}"
+            -d "{\\"environmentId\\":\\"${environmentId}\\",\\"imageUri\\":\\"registry.digitalocean.com/${docrName}/${imageRepository}:\$IMAGE_TAG\\",\\"commitSha\\":\\"$GITHUB_SHA\\",\\"status\\":\\"$JOB_STATUS\\",\\"runUrl\\":\\"$RUN_URL\\"}"
 `;
   }
 
