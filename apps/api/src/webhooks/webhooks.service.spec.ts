@@ -138,6 +138,7 @@ describe('WebhooksService', () => {
       configYaml: 'version: "1.0"',
       configParsed: null,
       liftoffDeploySecret: 'encrypted-deploy-secret',
+      pulumiStack: null,
     });
     encryptionServiceMock.decrypt.mockReturnValue('deploy-secret');
     prismaServiceMock.deployment.findFirst.mockResolvedValue({
@@ -159,7 +160,7 @@ describe('WebhooksService', () => {
       where: {
         environmentId: 'env-1',
         status: {
-          in: [DeploymentStatus.QUEUED, DeploymentStatus.PUSHING],
+          in: [DeploymentStatus.QUEUED, DeploymentStatus.BUILDING, DeploymentStatus.PUSHING],
         },
       },
       orderBy: {
@@ -192,12 +193,65 @@ describe('WebhooksService', () => {
     );
   });
 
+  it('handleDeployComplete queues deployments processor job when stack outputs exist', async () => {
+    prismaServiceMock.environment.findFirst.mockResolvedValue({
+      id: 'env-1',
+      configYaml: 'version: "1.0"',
+      configParsed: null,
+      liftoffDeploySecret: 'encrypted-deploy-secret',
+      pulumiStack: {
+        outputs: {
+          appId: 'app-123',
+          appUrl: 'https://my-app.ondigitalocean.app',
+        },
+      },
+    });
+    encryptionServiceMock.decrypt.mockReturnValue('deploy-secret');
+    prismaServiceMock.deployment.findFirst.mockResolvedValue({
+      id: 'deployment-1',
+    });
+    prismaServiceMock.deployment.update.mockResolvedValue(undefined);
+    deploymentsQueueMock.add.mockResolvedValue(undefined);
+
+    await service.handleDeployComplete(
+      {
+        environmentId: 'env-1',
+        imageUri: 'registry.digitalocean.com/liftoff/my-app/production:abc123',
+        commitSha: 'abc123',
+      },
+      'deploy-secret',
+    );
+
+    expect(prismaServiceMock.deployment.update).toHaveBeenCalledWith({
+      where: { id: 'deployment-1' },
+      data: {
+        commitSha: 'abc123',
+        imageUri: 'registry.digitalocean.com/liftoff/my-app/production:abc123',
+        status: DeploymentStatus.DEPLOYING,
+      },
+    });
+    expect(deploymentsQueueMock.add).toHaveBeenCalledWith(
+      JOB_NAMES.DEPLOYMENTS.DEPLOY,
+      {
+        deploymentId: 'deployment-1',
+        environmentId: 'env-1',
+        commitSha: 'abc123',
+      },
+      expect.objectContaining({
+        attempts: 3,
+        timeout: QUEUE_TIMEOUTS.DEPLOYMENT_JOB_TIMEOUT_MS,
+      }),
+    );
+    expect(infrastructureQueueMock.add).not.toHaveBeenCalled();
+  });
+
   it('handleDeployComplete marks deployment as failed when environment config is missing', async () => {
     prismaServiceMock.environment.findFirst.mockResolvedValue({
       id: 'env-1',
       configYaml: null,
       configParsed: null,
       liftoffDeploySecret: 'encrypted-deploy-secret',
+      pulumiStack: null,
     });
     encryptionServiceMock.decrypt.mockReturnValue('deploy-secret');
     prismaServiceMock.deployment.findFirst.mockResolvedValue({

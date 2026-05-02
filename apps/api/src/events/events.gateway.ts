@@ -17,6 +17,7 @@ import {
 } from '@liftoff/shared';
 import { Logger } from '@nestjs/common';
 import { Server, Socket } from 'socket.io';
+import { MonitoringService } from '../monitoring/monitoring.service';
 
 type HandshakeAuth = {
   token?: unknown;
@@ -41,8 +42,12 @@ export class EventsGateway implements OnGatewayConnection, OnGatewayDisconnect {
   private server!: Server;
 
   private readonly logger = new Logger(EventsGateway.name);
+  private activeLogStreams = new Map<string, AbortController>();
 
-  public constructor(private readonly jwtService: JwtService) {}
+  public constructor(
+    private readonly jwtService: JwtService,
+    private readonly monitoringService: MonitoringService,
+  ) {}
 
   public async handleConnection(client: Socket): Promise<void> {
     const token = this.resolveToken(client);
@@ -54,7 +59,8 @@ export class EventsGateway implements OnGatewayConnection, OnGatewayDisconnect {
     }
 
     try {
-      await this.jwtService.verifyAsync(token);
+      const payload = await this.jwtService.verifyAsync(token);
+      client.data.userId = payload.sub;
     } catch {
       this.logger.warn(`Socket ${client.id} failed JWT verification`);
       client.disconnect(true);
@@ -63,6 +69,11 @@ export class EventsGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
   public handleDisconnect(client: Socket): void {
     this.logger.debug(`Socket disconnected: ${client.id}`);
+    const abortController = this.activeLogStreams.get(client.id);
+    if (abortController) {
+      abortController.abort();
+      this.activeLogStreams.delete(client.id);
+    }
   }
 
   @SubscribeMessage(WsEvents.JOIN_DEPLOYMENT)
@@ -95,6 +106,30 @@ export class EventsGateway implements OnGatewayConnection, OnGatewayDisconnect {
     @MessageBody() payload: { environmentId: string },
   ): void {
     client.leave(this.getEnvironmentRoom(payload.environmentId));
+  }
+
+  @SubscribeMessage('start:log-stream')
+  public async startLogStream(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() payload: { environmentId: string },
+  ): Promise<void> {
+    const userId = client.data.userId as string;
+
+    if (!userId) {
+      client.emit('error', { message: 'Not authenticated' });
+      return;
+    }
+
+    try {
+      await this.monitoringService.streamLogs(payload.environmentId, userId, client);
+    } catch (error) {
+      this.logger.warn(
+        `Failed to stream logs for environment ${payload.environmentId}: ${
+          error instanceof Error ? error.message : 'Unknown error'
+        }`,
+      );
+      client.emit('error', { message: 'Failed to stream logs' });
+    }
   }
 
   /**

@@ -5,6 +5,7 @@ import { DoApiService } from './do-api.service';
 type HttpServiceMock = {
   get: jest.Mock;
   post: jest.Mock;
+  put: jest.Mock;
 };
 
 /**
@@ -16,6 +17,7 @@ describe('DoApiService', () => {
   const httpServiceMock: HttpServiceMock = {
     get: jest.fn(),
     post: jest.fn(),
+    put: jest.fn(),
   };
 
   const prismaServiceMock = {
@@ -80,6 +82,47 @@ describe('DoApiService', () => {
 
     expect(phase).toBe('ACTIVE');
     expect(prismaServiceMock.dOAccount.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('waitForDeployment resolves ACTIVE when deployment reaches active phase', async () => {
+    httpServiceMock.get.mockReturnValue(
+      of({
+        data: {
+          deployment: {
+            id: 'dep-1',
+            phase: 'ACTIVE',
+            created_at: '2026-01-01T00:00:00.000Z',
+            updated_at: '2026-01-01T00:00:10.000Z',
+          },
+        },
+      }),
+    );
+
+    await expect(service.waitForDeployment('dop_v1_token', 'app-1', 'dep-1', 11_000)).resolves.toBe(
+      'ACTIVE',
+    );
+  });
+
+  it('updateApp sends app spec payload to App Platform API', async () => {
+    httpServiceMock.put.mockReturnValue(
+      of({
+        data: {},
+      }),
+    );
+
+    await service.updateApp('dop_v1_token', 'app-1', { name: 'my-app' });
+
+    expect(httpServiceMock.put).toHaveBeenCalledWith(
+      'https://api.digitalocean.com/v2/apps/app-1',
+      {
+        spec: { name: 'my-app' },
+      },
+      {
+        headers: {
+          Authorization: 'Bearer dop_v1_token',
+        },
+      },
+    );
   });
 
   it('returns existing registry name when user already has a registry', async () => {

@@ -159,6 +159,7 @@ export class WebhooksService {
         commitSha: deployment.commitSha ?? undefined,
       },
       {
+        jobId: deployment.id,
         attempts: 3,
         backoff: { type: 'exponential', delay: 5000 },
         timeout: QUEUE_TIMEOUTS.DEPLOYMENT_JOB_TIMEOUT_MS,
@@ -200,6 +201,11 @@ export class WebhooksService {
         configYaml: true,
         configParsed: true,
         liftoffDeploySecret: true,
+        pulumiStack: {
+          select: {
+            outputs: true,
+          },
+        },
       },
     });
     if (!environment) {
@@ -227,7 +233,7 @@ export class WebhooksService {
       where: {
         environmentId: environment.id,
         status: {
-          in: [DeploymentStatus.QUEUED, DeploymentStatus.PUSHING],
+          in: [DeploymentStatus.QUEUED, DeploymentStatus.BUILDING, DeploymentStatus.PUSHING],
         },
       },
       orderBy: {
@@ -239,9 +245,39 @@ export class WebhooksService {
     });
     if (!deployment) {
       throw Exceptions.notFound(
-        'No deployment in QUEUED or PUSHING state for this environment',
+        'No deployment in QUEUED, BUILDING, or PUSHING state for this environment',
         ErrorCodes.DEPLOYMENT_NOT_FOUND,
       );
+    }
+
+    const appContext = this.resolveAppContext(environment.pulumiStack?.outputs);
+    if (appContext) {
+      await this.prismaService.deployment.update({
+        where: {
+          id: deployment.id,
+        },
+        data: {
+          commitSha: payload.commitSha,
+          imageUri: payload.imageUri,
+          status: DeploymentStatus.DEPLOYING,
+        },
+      });
+
+      await this.deploymentsQueue.add(
+        JOB_NAMES.DEPLOYMENTS.DEPLOY,
+        {
+          deploymentId: deployment.id,
+          environmentId: environment.id,
+          commitSha: payload.commitSha,
+        },
+        {
+          jobId: deployment.id,
+          attempts: 3,
+          backoff: { type: 'exponential', delay: 5000 },
+          timeout: QUEUE_TIMEOUTS.DEPLOYMENT_JOB_TIMEOUT_MS,
+        } as Parameters<Queue<DeployJobPayload>['add']>[2] & { timeout: number },
+      );
+      return;
     }
 
     const resolvedConfigYaml = this.resolveConfigYaml(environment.configYaml, environment.configParsed);
@@ -306,6 +342,47 @@ export class WebhooksService {
     }
 
     return yaml.dump(parsedConfig.data);
+  }
+
+  private resolveAppContext(outputs: unknown): { appId: string; appUrl: string } | null {
+    if (!outputs || typeof outputs !== 'object' || Array.isArray(outputs)) {
+      return null;
+    }
+
+    const outputRecord = outputs as Record<string, unknown>;
+    const appId = this.resolveOutputValue(outputRecord.appId);
+    const appUrl = this.resolveOutputValue(outputRecord.appUrl);
+    if (!appId || !appUrl) {
+      return null;
+    }
+
+    return {
+      appId,
+      appUrl,
+    };
+  }
+
+  private resolveOutputValue(value: unknown): string | null {
+    if (typeof value === 'string') {
+      return value;
+    }
+
+    if (typeof value === 'number' || typeof value === 'boolean') {
+      return String(value);
+    }
+
+    if (value && typeof value === 'object' && !Array.isArray(value) && 'value' in value) {
+      const nestedValue = (value as { value?: unknown }).value;
+      if (typeof nestedValue === 'string') {
+        return nestedValue;
+      }
+
+      if (typeof nestedValue === 'number' || typeof nestedValue === 'boolean') {
+        return String(nestedValue);
+      }
+    }
+
+    return null;
   }
 
   private async markDeploymentFailedForMissingConfig(deploymentId: string): Promise<void> {

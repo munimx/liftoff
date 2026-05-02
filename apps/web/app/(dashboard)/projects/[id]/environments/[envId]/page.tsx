@@ -1,6 +1,7 @@
 'use client';
 
 import { zodResolver } from '@hookform/resolvers/zod';
+import Link from 'next/link';
 import { useParams, useRouter } from 'next/navigation';
 import { useEffect } from 'react';
 import { useForm } from 'react-hook-form';
@@ -210,7 +211,12 @@ export default function EnvironmentDetailPage(): JSX.Element {
             <div className="space-y-2">
               {environment.deployments.map((deployment) => (
                 <div key={deployment.id} className="rounded-md border px-3 py-2 text-sm">
-                  <span className="font-medium">{deployment.status}</span>
+                  <Link
+                    className="font-medium underline-offset-4 hover:underline"
+                    href={`/projects/${projectId}/environments/${environmentId}/deployments/${deployment.id}`}
+                  >
+                    {deployment.status}
+                  </Link>
                   <span className="ml-2 text-muted-foreground">
                     {new Date(deployment.createdAt).toLocaleString()}
                   </span>

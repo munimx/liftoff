@@ -1,5 +1,5 @@
 import { HttpService } from '@nestjs/axios';
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { randomBytes } from 'crypto';
 import { firstValueFrom } from 'rxjs';
 import { PrismaService } from '../prisma/prisma.service';
@@ -13,14 +13,43 @@ interface DigitalOceanAccountResponse {
 }
 
 interface DigitalOceanDeploymentResponse {
-  deployment: {
-    phase: string;
-  };
+  deployment: DODepployment;
 }
 
 interface DigitalOceanRegistryResponse {
   registry: {
     name: string;
+  };
+}
+
+export interface DODepployment {
+  id: string;
+  phase: string;
+  created_at: string;
+  updated_at: string;
+  progress?: {
+    success_steps: number;
+    total_steps: number;
+  };
+}
+
+export interface DOApp {
+  id: string;
+  live_url?: string;
+  active_deployment?: {
+    id: string;
+    phase: string;
+  };
+  spec: Record<string, unknown>;
+}
+
+interface DigitalOceanAppResponse {
+  app: DOApp;
+}
+
+interface DigitalOceanCreateDeploymentResponse {
+  deployment: {
+    id: string;
   };
 }
 
@@ -68,14 +97,77 @@ export class DoApiService {
   }
 
   /**
-   * Fetches App Platform deployment status.
+   * Fetches one App Platform app with its current spec and deployment metadata.
    */
-  public async getAppDeploymentStatus(
+  public async getApp(doToken: string, appId: string, doAccountId?: string): Promise<DOApp> {
+    const { data } = await this.executeRequest(
+      firstValueFrom(
+        this.httpService.get<DigitalOceanAppResponse>(`${DoApiService.BASE_URL}/v2/apps/${appId}`, {
+          headers: this.getHeaders(doToken),
+        }),
+      ),
+      doAccountId,
+    );
+
+    return data.app;
+  }
+
+  /**
+   * Updates an App Platform app spec, which triggers a new deployment.
+   */
+  public async updateApp(
+    doToken: string,
+    appId: string,
+    appSpec: Record<string, unknown>,
+    doAccountId?: string,
+  ): Promise<void> {
+    await this.executeRequest(
+      firstValueFrom(
+        this.httpService.put(
+          `${DoApiService.BASE_URL}/v2/apps/${appId}`,
+          { spec: appSpec },
+          {
+            headers: this.getHeaders(doToken),
+          },
+        ),
+      ),
+      doAccountId,
+    );
+  }
+
+  /**
+   * Creates a force deployment for the target app and returns the deployment ID.
+   */
+  public async createDeployment(
+    doToken: string,
+    appId: string,
+    doAccountId?: string,
+  ): Promise<string> {
+    const { data } = await this.executeRequest(
+      firstValueFrom(
+        this.httpService.post<DigitalOceanCreateDeploymentResponse>(
+          `${DoApiService.BASE_URL}/v2/apps/${appId}/deployments`,
+          {},
+          {
+            headers: this.getHeaders(doToken),
+          },
+        ),
+      ),
+      doAccountId,
+    );
+
+    return data.deployment.id;
+  }
+
+  /**
+   * Returns one app deployment object.
+   */
+  public async getDeployment(
     doToken: string,
     appId: string,
     deploymentId: string,
     doAccountId?: string,
-  ): Promise<string> {
+  ): Promise<DODepployment> {
     const { data } = await this.executeRequest(
       firstValueFrom(
         this.httpService.get<DigitalOceanDeploymentResponse>(
@@ -88,7 +180,75 @@ export class DoApiService {
       doAccountId,
     );
 
-    return data.deployment.phase;
+    return data.deployment;
+  }
+
+  /**
+   * Returns deployment run logs as serialized text.
+   */
+  public async getDeploymentLogs(
+    doToken: string,
+    appId: string,
+    deploymentId: string,
+    doAccountId?: string,
+  ): Promise<string> {
+    const { data } = await this.executeRequest(
+      firstValueFrom(
+        this.httpService.get<unknown>(
+          `${DoApiService.BASE_URL}/v2/apps/${appId}/deployments/${deploymentId}/logs`,
+          {
+            headers: this.getHeaders(doToken),
+            params: { type: 'RUN' },
+          },
+        ),
+      ),
+      doAccountId,
+    );
+
+    return typeof data === 'string' ? data : JSON.stringify(data);
+  }
+
+  /**
+   * Polls deployment status until ACTIVE, ERROR-like phase, or timeout.
+   */
+  public async waitForDeployment(
+    doToken: string,
+    appId: string,
+    deploymentId: string,
+    timeoutMs: number,
+    doAccountId?: string,
+  ): Promise<'ACTIVE' | 'ERROR' | 'TIMEOUT'> {
+    const startedAt = Date.now();
+
+    while (Date.now() - startedAt < timeoutMs) {
+      const deployment = await this.getDeployment(doToken, appId, deploymentId, doAccountId);
+      const phase = deployment.phase.toUpperCase();
+
+      if (phase === 'ACTIVE') {
+        return 'ACTIVE';
+      }
+
+      if (phase === 'ERROR' || phase === 'CANCELED' || phase === 'FAILED') {
+        return 'ERROR';
+      }
+
+      await this.delay(10_000);
+    }
+
+    return 'TIMEOUT';
+  }
+
+  /**
+   * Fetches App Platform deployment status.
+   */
+  public async getAppDeploymentStatus(
+    doToken: string,
+    appId: string,
+    deploymentId: string,
+    doAccountId?: string,
+  ): Promise<string> {
+    const deployment = await this.getDeployment(doToken, appId, deploymentId, doAccountId);
+    return deployment.phase;
   }
 
   /**
@@ -113,6 +273,162 @@ export class DoApiService {
     );
 
     return typeof data === 'string' ? data : JSON.stringify(data);
+  }
+
+  /**
+   * Fetches app runtime logs (live application logs, not deployment logs).
+   */
+  public async getAppRuntimeLogs(
+    doToken: string,
+    appId: string,
+    logType: 'BUILD' | 'DEPLOY' | 'RUN' | 'RUN_RESTARTED' = 'RUN',
+    doAccountId?: string,
+  ): Promise<string[]> {
+    try {
+      const { data } = await this.executeRequest(
+        firstValueFrom(
+          this.httpService.get<unknown>(
+            `${DoApiService.BASE_URL}/v2/apps/${appId}/logs`,
+            {
+              headers: this.getHeaders(doToken),
+              params: { type: logType },
+            },
+          ),
+        ),
+        doAccountId,
+      );
+
+      if (typeof data === 'string') {
+        return data.split('\n').filter((line) => line.length > 0);
+      }
+
+      if (Array.isArray(data)) {
+        return data.map((item) => (typeof item === 'string' ? item : JSON.stringify(item)));
+      }
+
+      return [JSON.stringify(data)];
+    } catch (error) {
+      this.logger.warn(`Failed to fetch app runtime logs: ${this.resolveErrorMessage(error)}`);
+      return [];
+    }
+  }
+
+  /**
+   * Polls app runtime logs with optional follow mode (returns only new lines).
+   */
+  public async *getLiveAppLogs(
+    doToken: string,
+    appId: string,
+    logType: 'BUILD' | 'DEPLOY' | 'RUN' | 'RUN_RESTARTED' = 'RUN',
+    pollIntervalMs: number = 5000,
+    doAccountId?: string,
+  ): AsyncGenerator<string> {
+    let lastLogCount = 0;
+
+    while (true) {
+      try {
+        const logs = await this.getAppRuntimeLogs(doToken, appId, logType, doAccountId);
+        const newLogs = logs.slice(lastLogCount);
+
+        for (const line of newLogs) {
+          yield line;
+        }
+
+        lastLogCount = logs.length;
+      } catch (error) {
+        this.logger.debug(`Live log poll failed, retrying in ${pollIntervalMs}ms`);
+      }
+
+      await this.delay(pollIntervalMs);
+    }
+  }
+
+  /**
+   * Fetches app metrics from DO monitoring API.
+   */
+  public async getAppMetrics(
+    doToken: string,
+    appId: string,
+    metricType: 'cpu_percentage' | 'memory_percentage' | 'network_bandwidth',
+    doAccountId?: string,
+  ): Promise<Array<{ timestamp: number; value: number }>> {
+    try {
+      const { data } = await this.executeRequest(
+        firstValueFrom(
+          this.httpService.get<unknown>(
+            `${DoApiService.BASE_URL}/v2/monitoring/metrics/apps/${metricType}`,
+            {
+              headers: this.getHeaders(doToken),
+              params: { app_id: appId },
+            },
+          ),
+        ),
+        doAccountId,
+      );
+
+      return this.parseMetricsData(data);
+    } catch (error) {
+      this.logger.warn(`Failed to fetch app metrics: ${this.resolveErrorMessage(error)}`);
+      return [];
+    }
+  }
+
+  private parseMetricsData(data: unknown): Array<{ timestamp: number; value: number }> {
+    if (!data || typeof data !== 'object') {
+      return [];
+    }
+
+    const record = data as Record<string, unknown>;
+    if (!record.data || typeof record.data !== 'object') {
+      return [];
+    }
+
+    const dataRecord = record.data as Record<string, unknown>;
+    if (!Array.isArray(dataRecord.result)) {
+      return [];
+    }
+
+    const results: Array<{ timestamp: number; value: number }> = [];
+
+    for (const item of dataRecord.result) {
+      if (!item || typeof item !== 'object') {
+        continue;
+      }
+
+      const itemRecord = item as Record<string, unknown>;
+      if (!Array.isArray(itemRecord.values)) {
+        continue;
+      }
+
+      for (const [timestamp, value] of itemRecord.values as Array<[unknown, unknown]>) {
+        if (typeof timestamp === 'string' && typeof value === 'string') {
+          const ts = parseInt(timestamp, 10);
+          const val = parseFloat(value);
+          if (!isNaN(ts) && !isNaN(val)) {
+            results.push({ timestamp: ts * 1000, value: val });
+          }
+        }
+      }
+    }
+
+    return results.sort((a, b) => a.timestamp - b.timestamp);
+  }
+
+  private logger: { warn: (msg: string) => void; debug: (msg: string) => void } = new Logger(
+    DoApiService.name,
+  ) as any;
+
+  private resolveErrorMessage(error: unknown): string {
+    if (error instanceof Error) {
+      return error.message;
+    }
+    return 'Unknown error';
+  }
+
+  private async delay(ms: number): Promise<void> {
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, ms);
+    });
   }
 
   /**
