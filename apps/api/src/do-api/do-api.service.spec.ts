@@ -26,9 +26,13 @@ describe('DoApiService', () => {
     },
   };
 
+  const configServiceMock = {
+    getOrThrow: jest.fn(),
+  };
+
   beforeEach(() => {
     jest.clearAllMocks();
-    service = new DoApiService(httpServiceMock as never, prismaServiceMock as unknown as PrismaService);
+    service = new DoApiService(httpServiceMock as never, prismaServiceMock as unknown as PrismaService, configServiceMock as never);
   });
 
   it('invalidates a DO account when DigitalOcean responds with 401', async () => {

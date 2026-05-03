@@ -31,7 +31,9 @@ export default function EnvironmentLayout({ children }: { children: React.ReactN
   const baseUrl = `/projects/${projectId}/environments/${environmentId}`;
 
   const tabs: NavTab[] = [
-    { label: 'Deployments', href: baseUrl, testId: 'tab-deployments' },
+    { label: 'Overview', href: baseUrl, testId: 'tab-overview' },
+    { label: 'Pipeline', href: `${baseUrl}/pipeline`, testId: 'tab-pipeline' },
+    { label: 'History', href: `${baseUrl}/history`, testId: 'tab-history' },
     { label: 'Logs', href: `${baseUrl}/logs`, testId: 'tab-logs' },
     { label: 'Metrics', href: `${baseUrl}/metrics`, testId: 'tab-metrics' },
     { label: 'Settings', href: `${baseUrl}/settings`, testId: 'tab-settings' },

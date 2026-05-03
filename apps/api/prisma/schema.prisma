@@ -154,6 +154,7 @@ model Environment {
   pulumiStack  PulumiStack?
   resources    InfrastructureResource[]
   alerts       Alert[]
+  pipelineGraph PipelineGraph?
 
   @@unique([projectId, name])
   @@index([projectId])
@@ -239,4 +240,19 @@ model Alert {
   environment       Environment @relation(fields: [environmentId], references: [id], onDelete: Cascade)
 
   @@map("alerts")
+}
+
+model PipelineGraph {
+  id               String      @id @default(cuid())
+  environmentId    String      @unique @map("environment_id")
+  nodes            Json
+  edges            Json
+  compiledYaml     String?     @map("compiled_yaml")
+  isValid          Boolean     @default(false) @map("is_valid")
+  validationErrors Json?       @map("validation_errors")
+  createdAt        DateTime    @default(now()) @map("created_at")
+  updatedAt        DateTime    @updatedAt @map("updated_at")
+  environment      Environment @relation(fields: [environmentId], references: [id], onDelete: Cascade)
+
+  @@map("pipeline_graphs")
 }

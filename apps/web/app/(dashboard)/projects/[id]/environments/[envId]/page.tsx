@@ -2,7 +2,7 @@
 
 import { zodResolver } from '@hookform/resolvers/zod';
 import Link from 'next/link';
-import { useParams, useRouter } from 'next/navigation';
+import { useParams } from 'next/navigation';
 import { useEffect } from 'react';
 import { useForm } from 'react-hook-form';
 import { z } from 'zod';
@@ -12,7 +12,6 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/com
 import { Spinner } from '@/components/ui/spinner';
 import { toast } from '@/components/ui/use-toast';
 import {
-  useDeleteEnvironment,
   useEnvironment,
   useUpdateConfig,
   useValidateConfig,
@@ -49,14 +48,12 @@ function resolveRouteParam(param: string | string[] | undefined): string {
  * Environment detail page with config management and danger actions.
  */
 export default function EnvironmentDetailPage(): JSX.Element {
-  const router = useRouter();
   const params = useParams();
   const projectId = resolveRouteParam(params.id);
   const environmentId = resolveRouteParam(params.envId);
   const { data: environment, isLoading } = useEnvironment(projectId, environmentId);
   const updateConfigMutation = useUpdateConfig(projectId);
   const validateConfigMutation = useValidateConfig(projectId);
-  const deleteEnvironmentMutation = useDeleteEnvironment(projectId);
 
   const form = useForm<ConfigValues>({
     resolver: zodResolver(configSchema),
@@ -114,28 +111,6 @@ export default function EnvironmentDetailPage(): JSX.Element {
       });
     }
   });
-
-  const handleDeleteEnvironment = async (): Promise<void> => {
-    const confirmed = window.confirm('Delete this environment? This action can be undone only by recreating it.');
-    if (!confirmed) {
-      return;
-    }
-
-    try {
-      await deleteEnvironmentMutation.mutateAsync(environmentId);
-      toast({
-        title: 'Environment deleted',
-        description: 'The environment has been soft-deleted.',
-      });
-      router.push(`/projects/${projectId}`);
-    } catch {
-      toast({
-        title: 'Delete failed',
-        description: 'Unable to delete this environment right now.',
-        variant: 'destructive',
-      });
-    }
-  };
 
   if (isLoading) {
     return (
@@ -224,22 +199,6 @@ export default function EnvironmentDetailPage(): JSX.Element {
               ))}
             </div>
           )}
-        </CardContent>
-      </Card>
-
-      <Card className="border-destructive/30">
-        <CardHeader>
-          <CardTitle>Danger zone</CardTitle>
-          <CardDescription>Deleting an environment only soft-deletes metadata in Liftoff.</CardDescription>
-        </CardHeader>
-        <CardContent>
-          <Button
-            variant="destructive"
-            onClick={() => void handleDeleteEnvironment()}
-            disabled={deleteEnvironmentMutation.isPending}
-          >
-            {deleteEnvironmentMutation.isPending ? <Spinner className="h-4 w-4" /> : 'Delete environment'}
-          </Button>
         </CardContent>
       </Card>
     </section>

@@ -19,6 +19,24 @@ interface GitHubContentApiResponse {
   sha: string;
 }
 
+interface GitHubBlobApiResponse {
+  sha: string;
+}
+
+interface GitHubTreeApiResponse {
+  sha: string;
+}
+
+interface GitHubCommitApiResponse {
+  sha: string;
+}
+
+interface GitHubRefApiResponse {
+  object: {
+    sha: string;
+  };
+}
+
 interface GitHubWebhookApiResponse {
   id: number;
   config: {
@@ -251,6 +269,102 @@ export class GitHubService {
   }
 
   /**
+   * Creates a new GitHub repository for the authenticated user.
+   */
+  public async createRepository(
+    githubToken: string,
+    name: string,
+    isPrivate: boolean,
+  ): Promise<GitHubRepo> {
+    const { data } = await this.request<GitHubRepositoryApiResponse>(
+      {
+        method: 'POST',
+        url: '/user/repos',
+        data: {
+          name,
+          private: isPrivate,
+          auto_init: true,
+        },
+      },
+      githubToken,
+    );
+
+    return this.mapRepository(data);
+  }
+
+  /**
+   * Pushes multiple files to a repository in a single commit using the Git Data API.
+   */
+  public async pushFiles(
+    githubToken: string,
+    fullName: string,
+    files: Array<{ path: string; content: string }>,
+    commitMessage: string,
+    branch: string,
+  ): Promise<string> {
+    const headRef = await this.getRef(githubToken, fullName, branch);
+    const parentSha = headRef;
+
+    const blobShas = await Promise.all(
+      files.map(async (file) => {
+        const { data } = await this.request<GitHubBlobApiResponse>(
+          {
+            method: 'POST',
+            url: `/repos/${fullName}/git/blobs`,
+            data: {
+              content: Buffer.from(file.content).toString('base64'),
+              encoding: 'base64',
+            },
+          },
+          githubToken,
+        );
+        return { path: file.path, sha: data.sha };
+      }),
+    );
+
+    const { data: tree } = await this.request<GitHubTreeApiResponse>(
+      {
+        method: 'POST',
+        url: `/repos/${fullName}/git/trees`,
+        data: {
+          base_tree: parentSha,
+          tree: blobShas.map((blob) => ({
+            path: blob.path,
+            mode: '100644',
+            type: 'blob',
+            sha: blob.sha,
+          })),
+        },
+      },
+      githubToken,
+    );
+
+    const { data: commit } = await this.request<GitHubCommitApiResponse>(
+      {
+        method: 'POST',
+        url: `/repos/${fullName}/git/commits`,
+        data: {
+          message: commitMessage,
+          tree: tree.sha,
+          parents: [parentSha],
+        },
+      },
+      githubToken,
+    );
+
+    await this.request(
+      {
+        method: 'PATCH',
+        url: `/repos/${fullName}/git/refs/heads/${branch}`,
+        data: { sha: commit.sha },
+      },
+      githubToken,
+    );
+
+    return commit.sha;
+  }
+
+  /**
    * Verifies a GitHub webhook signature using HMAC-SHA256.
    */
   public verifyWebhookSignature(
@@ -321,6 +435,22 @@ export class GitHubService {
 
       throw error;
     }
+  }
+
+  private async getRef(
+    githubToken: string,
+    fullName: string,
+    branch: string,
+  ): Promise<string> {
+    const { data } = await this.request<GitHubRefApiResponse>(
+      {
+        method: 'GET',
+        url: `/repos/${fullName}/git/ref/heads/${branch}`,
+      },
+      githubToken,
+    );
+
+    return data.object.sha;
   }
 
   private encodeFilePath(path: string): string {

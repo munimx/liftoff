@@ -1,4 +1,5 @@
 import { Module } from '@nestjs/common';
+import { APP_GUARD } from '@nestjs/core';
 import { BullModule } from '@nestjs/bullmq';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { ScheduleModule } from '@nestjs/schedule';
@@ -7,6 +8,7 @@ import Joi from 'joi';
 import { AppController } from './app.controller';
 import { AuthModule } from './auth/auth.module';
 import { CommonModule } from './common/common.module';
+import { LiftoffThrottlerGuard } from './common/guards/throttler.guard';
 import { DeploymentsModule } from './deployments/deployments.module';
 import { DOAccountsModule } from './do-accounts/do-accounts.module';
 import { DoApiModule } from './do-api/do-api.module';
@@ -18,8 +20,10 @@ import { PrismaModule } from './prisma/prisma.module';
 import { ProjectsModule } from './projects/projects.module';
 import { QueuesModule } from './queues/queues.module';
 import { RepositoriesModule } from './repositories/repositories.module';
+import { UploadModule } from './upload/upload.module';
 import { UsersModule } from './users/users.module';
 import { WebhooksModule } from './webhooks/webhooks.module';
+import { PipelineModule } from './pipeline/pipeline.module';
 
 /**
  * Root application module.
@@ -93,7 +97,12 @@ import { WebhooksModule } from './webhooks/webhooks.module';
     InfrastructureModule,
     MonitoringModule,
     WebhooksModule,
+    UploadModule,
+    PipelineModule,
   ],
   controllers: [AppController],
+  providers: [
+    { provide: APP_GUARD, useClass: LiftoffThrottlerGuard },
+  ],
 })
 export class AppModule {}

@@ -1,5 +1,6 @@
 import { HttpService } from '@nestjs/axios';
 import { Injectable, Logger } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { randomBytes } from 'crypto';
 import { firstValueFrom } from 'rxjs';
 import { PrismaService } from '../prisma/prisma.service';
@@ -71,6 +72,7 @@ export class DoApiService {
   public constructor(
     private readonly httpService: HttpService,
     private readonly prismaService: PrismaService,
+    private readonly configService: ConfigService,
   ) {}
 
   /**
@@ -429,6 +431,29 @@ export class DoApiService {
     await new Promise<void>((resolve) => {
       setTimeout(resolve, ms);
     });
+  }
+
+  /**
+   * Downloads an object from DO Spaces (S3-compatible API).
+   */
+  public async getSpacesObject(bucket: string, key: string): Promise<Buffer> {
+    const endpoint = this.configService.getOrThrow<string>('DO_SPACES_ENDPOINT');
+    const accessKey = this.configService.getOrThrow<string>('DO_SPACES_ACCESS_KEY');
+    const secretKey = this.configService.getOrThrow<string>('DO_SPACES_SECRET_KEY');
+    const region = this.configService.getOrThrow<string>('DO_SPACES_REGION');
+
+    const url = `${endpoint}/${bucket}/${key}`;
+
+    const { data } = await firstValueFrom(
+      this.httpService.get<Buffer>(url, {
+        responseType: 'arraybuffer',
+        headers: {
+          Authorization: `AWS ${accessKey}:${secretKey}`,
+        },
+      }),
+    );
+
+    return Buffer.from(data);
   }
 
   /**

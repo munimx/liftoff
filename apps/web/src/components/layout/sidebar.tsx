@@ -1,6 +1,6 @@
 'use client';
 
-import { FolderKanban, LayoutDashboard, LogOut, Rocket, Settings } from 'lucide-react';
+import { FolderKanban, LayoutDashboard, LogOut, Rocket, Settings, Zap } from 'lucide-react';
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
 import { Button } from '@/components/ui/button';
@@ -11,6 +11,7 @@ import { useAuthStore } from '@/store/auth.store';
 const navigationItems = [
   { href: '/dashboard', label: 'Dashboard', icon: LayoutDashboard },
   { href: '/projects', label: 'Projects', icon: FolderKanban },
+  { href: '/deploy', label: 'Simple Mode', icon: Zap },
   { href: '/settings', label: 'Settings', icon: Settings },
 ];
 

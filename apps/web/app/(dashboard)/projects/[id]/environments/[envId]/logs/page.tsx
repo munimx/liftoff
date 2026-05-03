@@ -1,12 +1,13 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useParams } from 'next/navigation';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
-import { LogViewer } from '@/components/deployments/log-viewer';
+import { LogViewer, type DeploymentLogViewerEntry } from '@/components/deployments/log-viewer';
 import { apiClient } from '@/lib/api-client';
+import { getSocket } from '@/lib/ws-client';
 import { useAuthStore } from '@/store/auth.store';
 import { Download, Pause, Play, RefreshCw } from 'lucide-react';
 
@@ -19,12 +20,10 @@ interface AppLogEntry {
   source: string;
 }
 
-/**
- * Environment logs page for viewing live application logs.
- */
 export default function EnvironmentLogsPage(): JSX.Element {
   const params = useParams() as { id: string; envId: string };
-  const isAuthenticated = useAuthStore((state: any) => state.isAuthenticated);
+  const isAuthenticated = useAuthStore((state) => state.isAuthenticated);
+  const accessToken = useAuthStore((state) => state.accessToken);
 
   const [activeLogType, setActiveLogType] = useState<LogType>('RUN');
   const [logs, setLogs] = useState<AppLogEntry[]>([]);
@@ -32,50 +31,58 @@ export default function EnvironmentLogsPage(): JSX.Element {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
+  const liveLogIdRef = useRef(0);
+
+  const fetchLogs = useCallback(async () => {
+    if (!isAuthenticated || !params.envId) return;
+
+    setIsLoading(true);
+    setError(null);
+    try {
+      const response = await apiClient.get(`/environments/${params.envId}/logs`, {
+        params: { type: activeLogType, limit: 200 },
+      });
+      setLogs(response.data);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to fetch logs');
+    } finally {
+      setIsLoading(false);
+    }
+  }, [isAuthenticated, params.envId, activeLogType]);
 
   useEffect(() => {
-    if (!isAuthenticated || !params.envId) {
-      return;
+    fetchLogs();
+  }, [fetchLogs]);
+
+  useEffect(() => {
+    if (!isLiveTailing || !accessToken || !params.envId) return;
+
+    const socket = getSocket(accessToken);
+    if (!socket.connected) {
+      socket.connect();
     }
 
-    const fetchLogs = async () => {
-      setIsLoading(true);
-      setError(null);
-
-      try {
-        const response = await apiClient.get(`/environments/${params.envId}/logs`, {
-          params: {
-            type: activeLogType,
-            limit: 200,
-          },
-        });
-
-        setLogs(response.data);
-      } catch (err) {
-        setError(err instanceof Error ? err.message : 'Failed to fetch logs');
-      } finally {
-        setIsLoading(false);
-      }
+    const handleLogLine = (payload: { line: string; timestamp: string }): void => {
+      liveLogIdRef.current += 1;
+      const entry: AppLogEntry = {
+        line: payload.line,
+        timestamp: payload.timestamp,
+        level: 'INFO',
+        source: 'live',
+      };
+      setLogs((prev) => [...prev, entry]);
     };
 
-    fetchLogs();
-
-    // Auto-refresh every 5 seconds if live tailing is enabled
-    let interval: NodeJS.Timeout | null = null;
-    if (isLiveTailing) {
-      interval = setInterval(fetchLogs, 5000);
-    }
+    socket.emit('start:log-stream', { environmentId: params.envId });
+    socket.on('log-line', handleLogLine);
 
     return () => {
-      if (interval) {
-        clearInterval(interval);
-      }
+      socket.off('log-line', handleLogLine);
     };
-  }, [params.envId, activeLogType, isLiveTailing, isAuthenticated]);
+  }, [isLiveTailing, accessToken, params.envId]);
 
   const handleExport = () => {
     const content = logs.map((log) => `[${log.timestamp}] ${log.level} ${log.line}`).join('\n');
-
     const blob = new Blob([content], { type: 'text/plain' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -86,13 +93,19 @@ export default function EnvironmentLogsPage(): JSX.Element {
   };
 
   const filteredLogs = logs.filter((log) => {
-    if (!searchQuery) {
-      return true;
-    }
+    if (!searchQuery) return true;
     return log.line.toLowerCase().includes(searchQuery.toLowerCase());
   });
 
   const logTypes: LogType[] = ['BUILD', 'DEPLOY', 'RUN', 'RUN_RESTARTED'];
+
+  const logViewerEntries: DeploymentLogViewerEntry[] = filteredLogs.map((log, i) => ({
+    id: `${log.timestamp}-${i}`,
+    line: log.line,
+    level: log.level,
+    timestamp: log.timestamp,
+    source: log.source,
+  }));
 
   return (
     <div className="space-y-6">
@@ -103,7 +116,6 @@ export default function EnvironmentLogsPage(): JSX.Element {
 
       <Card className="p-6">
         <div className="space-y-4">
-          {/* Log Type Buttons */}
           <div className="flex gap-2 border-b pb-4">
             {logTypes.map((type) => (
               <Button
@@ -116,7 +128,6 @@ export default function EnvironmentLogsPage(): JSX.Element {
             ))}
           </div>
 
-          {/* Controls */}
           <div className="space-y-4">
             <div className="flex items-center gap-2">
               <Input
@@ -130,7 +141,13 @@ export default function EnvironmentLogsPage(): JSX.Element {
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => setIsLiveTailing(!isLiveTailing)}
+                onClick={() => {
+                  if (isLiveTailing) {
+                    setIsLiveTailing(false);
+                  } else {
+                    setIsLiveTailing(true);
+                  }
+                }}
               >
                 {isLiveTailing ? (
                   <>
@@ -148,22 +165,7 @@ export default function EnvironmentLogsPage(): JSX.Element {
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => {
-                  const fetchLogs = async () => {
-                    try {
-                      const response = await apiClient.get(
-                        `/environments/${params.envId}/logs`,
-                        {
-                          params: { type: activeLogType, limit: 200 },
-                        },
-                      );
-                      setLogs(response.data);
-                    } catch {
-                      // Ignore refresh errors
-                    }
-                  };
-                  fetchLogs();
-                }}
+                onClick={() => void fetchLogs()}
                 disabled={isLoading}
               >
                 <RefreshCw className={`h-4 w-4 ${isLoading ? 'animate-spin' : ''}`} />
@@ -175,28 +177,17 @@ export default function EnvironmentLogsPage(): JSX.Element {
               </Button>
             </div>
 
-            {/* Status */}
             {error && <div className="text-sm text-red-600">Error: {error}</div>}
             {isLoading && <div className="text-sm text-gray-600">Loading logs...</div>}
             {isLiveTailing && (
-              <div className="text-sm text-green-600">Live tailing enabled</div>
+              <div className="text-sm text-green-600">Live tailing via WebSocket</div>
             )}
           </div>
 
-          {/* Log Viewer */}
           <div className="border rounded-lg overflow-hidden" style={{ height: '600px' }}>
-            <LogViewer
-              logs={filteredLogs.map((log) => ({
-                id: `${log.timestamp}-${log.line}`,
-                line: log.line,
-                level: log.level,
-                timestamp: log.timestamp,
-                source: log.source,
-              }))}
-            />
+            <LogViewer logs={logViewerEntries} />
           </div>
 
-          {/* Summary */}
           <div className="text-sm text-gray-600">
             {filteredLogs.length} of {logs.length} log entries displayed
           </div>
@@ -205,4 +196,3 @@ export default function EnvironmentLogsPage(): JSX.Element {
     </div>
   );
 }
-
