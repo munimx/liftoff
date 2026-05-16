@@ -1,0 +1,49 @@
+# ------------------------------------------------------------------------------
+# Base Stage - Dependencies
+# ------------------------------------------------------------------------------
+FROM node:20-alpine AS base
+RUN npm install -g pnpm@9
+
+WORKDIR /app
+COPY pnpm-workspace.yaml package.json pnpm-lock.yaml ./
+COPY packages/config/package.json packages/config/
+COPY packages/shared/package.json packages/shared/
+COPY apps/web/package.json apps/web/
+COPY apps/api/package.json apps/api/
+RUN pnpm install --frozen-lockfile
+
+# ------------------------------------------------------------------------------
+# Development Stage
+# ------------------------------------------------------------------------------
+FROM base AS development
+COPY packages/ packages/
+COPY apps/web/ apps/web/
+
+WORKDIR /app/apps/web
+EXPOSE 3000
+CMD ["pnpm", "dev"]
+
+# ------------------------------------------------------------------------------
+# Builder Stage
+# ------------------------------------------------------------------------------
+FROM base AS builder
+COPY packages/ packages/
+COPY apps/web/ apps/web/
+RUN pnpm --filter shared build
+RUN pnpm --filter web build
+
+# ------------------------------------------------------------------------------
+# Production Stage
+# ------------------------------------------------------------------------------
+FROM base AS production
+COPY --from=builder /app/packages/shared/dist ./packages/shared/dist
+COPY --from=builder /app/packages/shared/package.json ./packages/shared/package.json
+COPY --from=builder /app/apps/web/.next ./apps/web/.next
+COPY --from=builder /app/apps/web/node_modules ./apps/web/node_modules
+COPY --from=builder /app/apps/web/package.json ./apps/web/package.json
+COPY --from=builder /app/apps/web/next.config.js ./apps/web/next.config.js
+COPY --from=builder /app/apps/web/next-env.d.ts ./apps/web/next-env.d.ts
+
+WORKDIR /app/apps/web
+EXPOSE 3000
+CMD ["pnpm", "start"]

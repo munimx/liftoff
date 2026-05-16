@@ -77,6 +77,41 @@ liftoff/
 
 ## Local Development Setup
 
+Choose one of the two setup methods below:
+
+### Option A: Docker (Recommended for New Developers)
+
+Complete containerized setup with hot-reloading — no need to install Node.js, pnpm, or PostgreSQL locally.
+
+```bash
+# 1. Clone and start everything with Docker
+git clone https://github.com/YOUR_ORG/liftoff.git && cd liftoff
+
+# 2. Build and start all services (PostgreSQL, Redis, API, Web)
+docker compose build
+docker compose up -d
+
+# 3. Run database migrations inside the API container
+docker compose exec api pnpm db:migrate
+
+# 4. Access the application
+# Web UI:  http://localhost:3000
+# API:     http://localhost:4000
+# Postgres: localhost:5432 (user: liftoff, password: liftoff, db: liftoff)
+# Redis:   localhost:6379
+
+# 5. View logs
+docker compose logs -f api
+docker compose logs -f web
+
+# 6. Stop everything
+docker compose down
+```
+
+> **Hot-reloading enabled:** Source code changes in `apps/api/src` and `apps/web/src` are reflected in the containers automatically via volume mounts.
+
+### Option B: Native Development
+
 ```bash
 # 1. Clone and install
 git clone https://github.com/YOUR_ORG/liftoff.git && cd liftoff
